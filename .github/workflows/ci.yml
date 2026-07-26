@@ -42,7 +42,7 @@ jobs:
       - name: Compile and transpile the portable Component boundary
         run: |
           git clone https://github.com/kotoba-lang/compiler.git ../compiler
-          git -C ../compiler checkout --detach 4e4056e35b1118ced1f92144ccb891e0c12eb075
+          git -C ../compiler checkout --detach 3a47501190d906cb0c3995025d2fe0309db47add
           (
             cd ../compiler
             clojure -M -m kotoba.compiler.cli compile \
