@@ -21,4 +21,43 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked --manifest-path native/component-host/Cargo.toml
-
+  browser-component:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: DeLaGuardo/setup-clojure@13.0
+        with:
+          cli: latest
+      - uses: bytecodealliance/actions/wasm-tools/setup@7ee36389ead2e51422087f820a7e17e39811b05f
+        with:
+          version: "1.243.0"
+      - run: npm ci
+      - name: Compile and transpile the portable Component boundary
+        run: |
+          git clone https://github.com/kotoba-lang/compiler.git ../compiler
+          git -C ../compiler checkout --detach 4e4056e35b1118ced1f92144ccb891e0c12eb075
+          (
+            cd ../compiler
+            clojure -M -m kotoba.compiler.cli compile \
+              "$GITHUB_WORKSPACE/qualification/browser-component.kotoba" \
+              --target component \
+              --output "$GITHUB_WORKSPACE/web/browser.component.wasm"
+          )
+          npx jco transpile web/browser.component.wasm \
+            -o web/generated --name component --no-typescript --quiet
+      - name: Verify the jco-transpiled Component surface in Chromium
+        run: |
+          python3 -m http.server 4173 --directory web >/tmp/tender-component-http.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          result=$(google-chrome --headless --disable-gpu --no-sandbox \
+            --virtual-time-budget=15000 --dump-dom \
+            http://127.0.0.1:4173/verify-component-browser.html)
+          echo "$result" | grep 'PASS:compiler-component-jco-chromium:42'
