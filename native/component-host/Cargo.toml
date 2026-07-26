@@ -1,0 +1,13 @@
+[package]
+name = "tender-component-host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0.100"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+# Keep the native TCB small: no WASI, GC, cache, profiling, debugger,
+# component-async, or automatic parallel compilation surfaces.
+wasmtime = { version = "=42.0.1", default-features = false, features = ["component-model", "cranelift", "runtime"] }

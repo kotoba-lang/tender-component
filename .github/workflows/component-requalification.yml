@@ -1,0 +1,49 @@
+name: Component Model requalification
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  detect-upstream-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Resolve current upstream releases
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          wasm_tools=$(gh api repos/bytecodealliance/wasm-tools/releases/latest --jq .tag_name | sed 's/^v//')
+          jco=$(npm view @bytecodealliance/jco version)
+          wasmtime=$(gh api repos/bytecodealliance/wasmtime/releases/latest --jq .tag_name | sed 's/^v//')
+          printf 'wasm_tools=%s\njco=%s\nwasmtime=%s\n' "$wasm_tools" "$jco" "$wasmtime" >> "$GITHUB_OUTPUT"
+      - name: Open one actionable requalification issue on drift
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WASM_TOOLS: ${{ steps.versions.outputs.wasm_tools }}
+          JCO: ${{ steps.versions.outputs.jco }}
+          WASMTIME: ${{ steps.versions.outputs.wasmtime }}
+        run: |
+          baseline_wasm_tools=1.243.0
+          baseline_jco=1.17.9
+          baseline_wasmtime=42.0.1
+          if [ "$WASM_TOOLS" = "$baseline_wasm_tools" ] &&
+             [ "$JCO" = "$baseline_jco" ] &&
+             [ "$WASMTIME" = "$baseline_wasmtime" ]; then
+            exit 0
+          fi
+          title="Component Model requalification: wasm-tools $WASM_TOOLS, jco $JCO, wasmtime $WASMTIME"
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq 'length')
+          if [ "$existing" -eq 0 ]; then
+            body="Automated upstream drift detection found versions beyond the qualified baseline. Run the full compiler, Wasmtime, jco/Node and jco/Chromium matrix, including policy denial, epoch revocation, one-shot exhaustion and crash recovery. Update qualification/component-requalification.edn only after all gates pass."
+            gh issue create --title "$title" --body "$body"
+          fi
