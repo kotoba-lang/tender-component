@@ -7,6 +7,7 @@
   authority escape hatch."
   (:require [clojure.string :as str]
             [clojure.data.json :as json]
+            [kotoba.abi.contract :as abi]
             [kototama.aiueos-adapter :as aiueos-adapter]
             [kototama.component-platform :as platform]
             [kototama.component-provider :as provider])
@@ -80,7 +81,7 @@
    synchronously delegated through the previously admitted provider boundary."
   [{:keys [runtime component-bytes imports abilities budgets artifact providers
            component-host runtime-bindings lease lease-epoch now-ms
-           lease-authorize? execution-identity]}]
+           lease-authorize? execution-identity audit-sink]}]
   (when-not (contains? provider/component-runtimes runtime)
     (reject :runtime-mismatch "a qualified Component adapter was not selected"))
   (when-not (bytes? component-bytes)
@@ -89,7 +90,12 @@
     (reject :provider-free-component "effectful runner requires an admitted import"))
   (when-not (= (set (keys imports)) (set (keys abilities)))
     (reject :ability-mismatch "native Component imports and abilities must be exact"))
-  (let [prepared (provider/prepare!
+  (let [typed-v3? (= abi/typed-capability-world-v3 (:component-world artifact))
+        _ (when (and typed-v3?
+                     (not (and (map? lease) (ifn? audit-sink))))
+            (reject :typed-proof-required
+                    "typed v0.3 execution requires an admitted lease and persistent audit sink"))
+        prepared (provider/prepare!
                   {:runtime runtime :component? true :artifact artifact
                    :grants (set (keys imports)) :providers providers
                    :lease lease :lease-epoch lease-epoch :now-ms now-ms
@@ -116,7 +122,11 @@
                                        :ability (host-ability ability)})
                                     abilities)
                      :fuel (long (or (:fuel budgets) 1))
-                     :memory-pages (long (or (:memory-pages budgets) 1))}
+                     :memory-pages (long (or (:memory-pages budgets) 1))
+                     :lease (when typed-v3?
+                              {:epoch (:aiueos/epoch lease)
+                               :not-before (:aiueos/not-before lease)
+                               :expires-at (:aiueos/expires-at lease)})}
             outcome (future
                       (write-json-line! writer request)
                       (loop []
@@ -126,15 +136,36 @@
                           (case (:type message)
                             "provider-call"
                             (let [import (keyword "aiueos.component" (:import message))
-                                  result (provider/invoke! prepared import (:payload message))]
+                                  payload (:payload message)
+                                  legacy-scalar? (contains? payload :value)
+                                  result (provider/invoke! prepared import payload)
+                                  observed-at (long (if (ifn? now-ms) (now-ms) now-ms))
+                                  audit-receipt
+                                  (when typed-v3?
+                                    (audit-sink
+                                     {:audit-id (get-in abilities [import :audit-id])
+                                      :import import :ability (get abilities import)
+                                      :payload payload :result result
+                                      :lease-id (:aiueos/lease-id lease)
+                                      :epoch lease-epoch :observed-at observed-at}))]
                               (when-not (= (host-ability (get abilities import))
                                            (:ability message))
                                 (reject :ability-mismatch "native host changed an ability descriptor"))
-                              (when-not (integer? result)
+                              (when (and legacy-scalar? (not (integer? result)))
                                 (reject :invalid-provider-result "Component provider must return i64"))
-                              (write-json-line! writer {:type "provider-result"
-                                                        :import (:import message)
-                                                        :value (long result)})
+                              (write-json-line!
+                               writer
+                               (cond-> {:type "provider-result"
+                                        :import (:import message)}
+                                 legacy-scalar? (assoc :value (long result))
+                                 (not legacy-scalar?)
+                                 (assoc :payload result
+                                        :audit-id (get-in abilities [import :audit-id])
+                                        :audit-receipt audit-receipt
+                                        :lease-proof
+                                        {:epoch lease-epoch
+                                         :observed-at observed-at
+                                         :expires-at (:aiueos/expires-at lease)})))
                               (recur))
                             "result" (cond-> {:result (long (:value message))
                                              :runtime runtime}
@@ -223,13 +254,14 @@
   The compiler artifact is only a compatibility fallback; it must never widen
   the effective abilities already placed in the admitted request."
   [admitted artifact providers
-   {:keys [runtime component-host execution-identity]}]
+   {:keys [runtime component-host execution-identity audit-sink]}]
   (assoc admitted
          :runtime runtime
          :artifact (or (:artifact admitted) artifact)
          :providers providers
          :component-host component-host
-         :execution-identity execution-identity))
+         :execution-identity execution-identity
+         :audit-sink audit-sink))
 
 (defn admit-and-run-with-aiueos!
   "Convenience composition kept outside kototama core: aiueos decides and

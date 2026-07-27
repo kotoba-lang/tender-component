@@ -365,14 +365,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "tender-component-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "wasmtime",
-]
+name = "kotoba-abi-wit"
+version = "0.2.0"
+source = "git+https://github.com/kotoba-lang/abi.git?rev=129b0b2fe26ddd1a3917132515bf1b903c7b763d#129b0b2fe26ddd1a3917132515bf1b903c7b763d"
 
 [[package]]
 name = "leb128fmt"
@@ -633,6 +628,17 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+
+[[package]]
+name = "tender-component-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kotoba-abi-wit",
+ "serde",
+ "serde_json",
+ "wasmtime",
+]
 
 [[package]]
 name = "termcolor"

@@ -25,11 +25,14 @@
   (let [import :aiueos.component/aiueos-http-post
         requested {:component-imports {import {:max-bytes 4096}}}
         effective {:component-imports {import {:max-bytes 64}}}
+        audit-sink (fn [_] "persisted")
         request (#'component/effective-run-request
                  {:artifact effective :abilities (:component-imports effective)}
                  requested {import :provider}
                  {:runtime :wasmtime-component
                   :component-host "/pinned/host"
+                  :audit-sink audit-sink
                   :execution-identity {:component-cid "cid"}})]
     (is (= effective (:artifact request)))
-    (is (= 64 (get-in request [:artifact :component-imports import :max-bytes])))))
+    (is (= 64 (get-in request [:artifact :component-imports import :max-bytes])))
+    (is (identical? audit-sink (:audit-sink request)))))
