@@ -218,6 +218,19 @@
                             :artifact artifact :providers providers
                             :component-host component-host)))))
 
+(defn- effective-run-request
+  "Preserve the authority-narrowed artifact supplied by Kototama admission.
+  The compiler artifact is only a compatibility fallback; it must never widen
+  the effective abilities already placed in the admitted request."
+  [admitted artifact providers
+   {:keys [runtime component-host execution-identity]}]
+  (assoc admitted
+         :runtime runtime
+         :artifact (or (:artifact admitted) artifact)
+         :providers providers
+         :component-host component-host
+         :execution-identity execution-identity))
+
 (defn admit-and-run-with-aiueos!
   "Convenience composition kept outside kototama core: aiueos decides and
   kototama validates the world, then this adapter executes it."
@@ -227,8 +240,5 @@
    artifact world component-bytes
    (fn [admitted]
      (run-effectful!
-      (assoc admitted :runtime (:runtime opts)
-             :artifact artifact :providers providers
-             :component-host component-host
-             :execution-identity execution-identity)))
+      (effective-run-request admitted artifact providers opts)))
    providers opts))

@@ -20,3 +20,16 @@
   (testing "an unqualified operation fails closed"
     (is (thrown? clojure.lang.ExceptionInfo
                  (#'component/host-ability {:operation :now})))))
+
+(deftest aiueos-effective-artifact-cannot-be-widened-by-the-compiler-artifact
+  (let [import :aiueos.component/aiueos-http-post
+        requested {:component-imports {import {:max-bytes 4096}}}
+        effective {:component-imports {import {:max-bytes 64}}}
+        request (#'component/effective-run-request
+                 {:artifact effective :abilities (:component-imports effective)}
+                 requested {import :provider}
+                 {:runtime :wasmtime-component
+                  :component-host "/pinned/host"
+                  :execution-identity {:component-cid "cid"}})]
+    (is (= effective (:artifact request)))
+    (is (= 64 (get-in request [:artifact :component-imports import :max-bytes])))))
