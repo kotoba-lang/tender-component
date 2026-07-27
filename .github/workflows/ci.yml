@@ -16,6 +16,9 @@ jobs:
       - uses: bytecodealliance/actions/wasmtime/setup@7ee36389ead2e51422087f820a7e17e39811b05f
         with:
           version: "42.0.1"
+      - uses: bytecodealliance/actions/wasm-tools/setup@7ee36389ead2e51422087f820a7e17e39811b05f
+        with:
+          version: "1.243.0"
       - run: clojure -M:test
       - run: clojure -M:lint
   native-host:
@@ -36,6 +39,9 @@ jobs:
       - uses: bytecodealliance/actions/wasm-tools/setup@7ee36389ead2e51422087f820a7e17e39811b05f
         with:
           version: "1.243.0"
+      - uses: bytecodealliance/actions/wasmtime/setup@7ee36389ead2e51422087f820a7e17e39811b05f
+        with:
+          version: "42.0.1"
       - run: npm ci
       - run: cargo test --locked --manifest-path native/component-host/Cargo.toml
       - run: cargo build --locked --manifest-path native/component-host/Cargo.toml

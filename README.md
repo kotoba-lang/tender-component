@@ -19,7 +19,9 @@ Component is also executed through the Wasmtime and jco/Node adapters, including
 grant, lease, byte/item quota, and persistent audit-receipt checks. Its type is
 checked before transpilation so a v1 binary cannot pass under v0.3 metadata.
 
-The same native binary has a resident mode for murakumo canaries.
+The separate `tender-resident-component-host` binary provides the resident
+mode for murakumo canaries, keeping that authority surface out of the typed
+v0.3 protocol host.
 It binds loopback only, verifies the exact Component bytes before readiness,
 and emits node-key-signed, fsync'd execution receipts. It does not add a WASI
 linker. With no capability configuration it is provider-free; with a
