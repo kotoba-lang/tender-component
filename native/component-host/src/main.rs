@@ -497,7 +497,12 @@ struct HttpCapability {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct StorageCapability {
-    log: PathBuf,
+    #[serde(default)]
+    log: Option<PathBuf>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    max_request_bytes: Option<u64>,
     max_write_bytes: u64,
     deadline_ms: u64,
     audit_id: String,
@@ -703,6 +708,54 @@ fn record_i64(fields: &[(String, Val)], name: &str) -> Result<i64> {
         .ok_or_else(|| anyhow!("structured storage record is missing field {name}"))
 }
 
+fn storage_result_from_json(response: &Value) -> Result<Val> {
+    let tag = response
+        .get("tag")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("storage provider response is missing tag"))?;
+    let string = |name: &str| {
+        response
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("storage provider response is missing {name}"))
+    };
+    let integer = |name: &str| {
+        response
+            .get(name)
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("storage provider response is missing {name}"))
+    };
+    let boolean = |name: &str| {
+        response
+            .get(name)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow!("storage provider response is missing {name}"))
+    };
+    let payload = match tag {
+        "found" | "written" => Val::Record(vec![
+            ("key".into(), Val::String(string("key")?)),
+            ("value".into(), Val::String(string("value")?)),
+            ("version".into(), Val::S64(integer("version")?)),
+        ]),
+        "missing" | "conflict-missing" | "deleted" => Val::Bool(boolean("value")?),
+        "conflict-current" => Val::Record(vec![
+            ("key".into(), Val::String(string("key")?)),
+            (
+                "current-version".into(),
+                Val::S64(integer("current-version")?),
+            ),
+        ]),
+        "error" => Val::Record(vec![
+            ("code".into(), Val::String(string("code")?)),
+            ("message".into(), Val::String(string("message")?)),
+            ("retryable".into(), Val::Bool(boolean("retryable")?)),
+        ]),
+        _ => bail!("storage provider response tag is outside the admitted subset"),
+    };
+    Ok(Val::Variant(tag.into(), Some(Box::new(payload))))
+}
+
 fn conditional_values(path: &Path, max_bytes: u64) -> Result<BTreeMap<String, (String, i64)>> {
     if !path.exists() {
         return Ok(BTreeMap::new());
@@ -812,7 +865,10 @@ impl EffectSession {
                     "http-response": response,
                     "recorded-at-ms": now_ms()?
                 });
-                let written = append_json_line(&storage.log, &record, storage.max_write_bytes)?;
+                let log = storage.log.as_deref().ok_or_else(|| {
+                    anyhow!("scalar storage capability requires an admitted local log")
+                })?;
+                let written = append_json_line(log, &record, storage.max_write_bytes)?;
                 let result = i64::try_from(written)
                     .context("storage write length does not fit the scalar Component ABI")?;
                 self.stored_bytes = Some(result);
@@ -1147,13 +1203,83 @@ impl EffectSession {
             bail!("structured storage must return one result variant");
         }
         let key = record_string(fields, "key")?;
-        let value = record_string(fields, "value")?;
-        if key.is_empty() || key.len() > 4096 || value.len() > storage.max_write_bytes as usize {
+        if key.is_empty() || key.len() > 4096 {
             bail!("structured storage request exceeds its admitted bounds");
         }
-        let current = conditional_values(&storage.log, storage.max_write_bytes)?
+        if let Some(endpoint) = storage.endpoint.as_deref() {
+            let mut request = json!({"operation": operation, "key": key});
+            if matches!(operation.as_str(), "put-new" | "put-existing") {
+                let value = record_string(fields, "value")?;
+                if value.len() > storage.max_write_bytes as usize {
+                    bail!("structured storage request exceeds its admitted bounds");
+                }
+                request["value"] = Value::String(value);
+            }
+            if operation == "put-existing" {
+                request["expected-version"] =
+                    Value::Number(record_i64(fields, "expected-version")?.into());
+            }
+            let request_bytes = serde_json::to_vec(&request)?.len();
+            let request_limit = storage
+                .max_request_bytes
+                .unwrap_or(storage.max_write_bytes)
+                .min(ability.max_bytes);
+            if request_bytes > request_limit as usize {
+                bail!("structured storage provider request exceeds its admitted byte bound");
+            }
+            let (_, response, response_bytes) = post_loopback_json(
+                endpoint,
+                &request,
+                storage.deadline_ms.min(ability.deadline_ms),
+                storage.max_write_bytes.min(ability.max_bytes),
+            )?;
+            results[0] = storage_result_from_json(&response)?;
+            self.events.push(json!({
+                "ability-audit-id": ability.audit_id,
+                "at-ms": now_ms()?,
+                "capability": "aiueos-storage-transact",
+                "operation": operation,
+                "outcome": response.get("tag"),
+                "request-key": key,
+                "response-bytes": response_bytes,
+                "target": ability.target
+            }));
+            return Ok(());
+        }
+        let log = storage
+            .log
+            .as_deref()
+            .ok_or_else(|| anyhow!("storage capability has no admitted provider"))?;
+        let current = conditional_values(log, storage.max_write_bytes)?
             .get(&key)
             .cloned();
+        if operation == "get" {
+            results[0] = match current {
+                Some((value, version)) => Val::Variant(
+                    "found".into(),
+                    Some(Box::new(Val::Record(vec![
+                        ("key".into(), Val::String(key.clone())),
+                        ("value".into(), Val::String(value)),
+                        ("version".into(), Val::S64(version)),
+                    ]))),
+                ),
+                None => Val::Variant("missing".into(), Some(Box::new(Val::Bool(true)))),
+            };
+            self.events.push(json!({
+                "ability-audit-id": ability.audit_id,
+                "at-ms": now_ms()?,
+                "capability": "aiueos-storage-transact",
+                "operation": operation,
+                "request-key": key,
+                "response-bytes": 0,
+                "target": ability.target
+            }));
+            return Ok(());
+        }
+        let value = record_string(fields, "value")?;
+        if value.len() > storage.max_write_bytes as usize {
+            bail!("structured storage request exceeds its admitted bounds");
+        }
         let next_version = match operation.as_str() {
             "put-new" => match current {
                 Some((_, version)) => {
@@ -1202,7 +1328,7 @@ impl EffectSession {
             "value": value,
             "version": next_version
         });
-        let written = append_json_line(&storage.log, &record, storage.max_write_bytes)?;
+        let written = append_json_line(log, &record, storage.max_write_bytes)?;
         results[0] = Val::Variant(
             "written".into(),
             Some(Box::new(Val::Record(vec![
@@ -1313,13 +1439,21 @@ fn read_capability_config() -> Result<Option<(Arc<ResidentCapabilityConfig>, Str
             bail!("resident HTTP capability contains an unbounded field");
         }
     }
-    if let Some(storage) = config.storage.as_ref()
-        && (!storage.log.is_absolute()
+    if let Some(storage) = config.storage.as_ref() {
+        if let Some(endpoint) = storage.endpoint.as_deref() {
+            loopback_endpoint(endpoint)?;
+        }
+        let provider_count =
+            usize::from(storage.log.is_some()) + usize::from(storage.endpoint.is_some());
+        if provider_count != 1
+            || storage.log.as_ref().is_some_and(|path| !path.is_absolute())
+            || storage.max_request_bytes == Some(0)
             || storage.audit_id.is_empty()
             || storage.max_write_bytes == 0
-            || storage.deadline_ms == 0)
-    {
-        bail!("resident storage capability contains an unbounded field");
+            || storage.deadline_ms == 0
+        {
+            bail!("resident storage capability contains an unbounded field");
+        }
     }
     if let Some(llm) = config.llm.as_ref() {
         loopback_endpoint(&llm.endpoint)?;
@@ -1351,10 +1485,18 @@ fn resident_imports(config: &ResidentCapabilityConfig) -> Vec<Import> {
         });
     }
     if let Some(storage) = config.storage.as_ref() {
+        let target = storage.endpoint.clone().unwrap_or_else(|| {
+            storage
+                .log
+                .as_ref()
+                .expect("validated storage provider")
+                .to_string_lossy()
+                .into_owned()
+        });
         imports.push(Import {
             name: "aiueos-storage-transact".into(),
             ability: Ability {
-                target: storage.log.to_string_lossy().into_owned(),
+                target,
                 operation: "storage/transact".into(),
                 max_bytes: storage.max_write_bytes,
                 max_items: 1,
@@ -1829,7 +1971,9 @@ mod tests {
                 audit_id: "http".into(),
             }),
             storage: Some(StorageCapability {
-                log,
+                log: Some(log),
+                endpoint: None,
+                max_request_bytes: None,
                 max_write_bytes: 65536,
                 deadline_ms: 1000,
                 audit_id: "storage".into(),
@@ -1924,6 +2068,16 @@ mod tests {
                 ("value".into(), Val::String(value.into())),
                 ("expected-version".into(), Val::S64(expected)),
             ]))),
+        )]
+    }
+
+    fn get_value(key: &str) -> Vec<Val> {
+        vec![Val::Variant(
+            "get".into(),
+            Some(Box::new(Val::Record(vec![(
+                "key".into(),
+                Val::String(key.into()),
+            )]))),
         )]
     }
 
@@ -2028,6 +2182,27 @@ mod tests {
         let imports = resident_imports(&config);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "aiueos-storage-transact");
+    }
+
+    #[test]
+    fn resident_capability_config_can_grant_loopback_storage_provider() {
+        let config: ResidentCapabilityConfig = serde_json::from_value(json!({
+            "format": "kototama.resident-capabilities/v1",
+            "storage": {
+                "endpoint": "http://127.0.0.1:18921/v1/storage",
+                "max-request-bytes": 65536,
+                "max-write-bytes": 65536,
+                "deadline-ms": 1000,
+                "audit-id": "commitment-kotobase"
+            }
+        }))
+        .unwrap();
+        let imports = resident_imports(&config);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(
+            imports[0].ability.target,
+            "http://127.0.0.1:18921/v1/storage"
+        );
     }
 
     #[test]
@@ -2253,7 +2428,87 @@ mod tests {
             conditional_values(&path, 65536).unwrap().get("order/1"),
             Some(&("v2".into(), 2))
         );
+        session
+            .transact_value(&ability, &get_value("order/1"), &mut result)
+            .unwrap();
+        assert!(matches!(
+            &result[0],
+            Val::Variant(case, Some(payload))
+                if case == "found"
+                    && matches!(payload.as_ref(), Val::Record(fields)
+                        if matches!(fields.get(1), Some((name, Val::String(value)))
+                            if name == "value" && value == "v2"))
+        ));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn structured_storage_uses_only_the_configured_loopback_provider() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://127.0.0.1:{}/v1/storage",
+            listener.local_addr().unwrap().port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !String::from_utf8_lossy(&request).contains(r#""operation":"get""#) {
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /v1/storage HTTP/1.1"));
+            assert!(request.contains(r#""key":"application/app-x""#));
+            let body =
+                br#"{"tag":"found","key":"application/app-x","value":"{\"id\":\"app-x\"}","version":7}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let mut session = EffectSession::new(Arc::new(ResidentCapabilityConfig {
+            format: "kototama.resident-capabilities/v1".into(),
+            http: None,
+            storage: Some(StorageCapability {
+                log: None,
+                endpoint: Some(endpoint.clone()),
+                max_request_bytes: Some(65536),
+                max_write_bytes: 65536,
+                deadline_ms: 1000,
+                audit_id: "commitment-kotobase".into(),
+            }),
+            llm: None,
+        }));
+        let ability = Ability {
+            target: endpoint,
+            operation: "storage/transact".into(),
+            max_bytes: 65536,
+            max_items: 1,
+            deadline_ms: 1000,
+            audit_id: "commitment-kotobase".into(),
+        };
+        let mut result = vec![Val::Bool(false)];
+        session
+            .transact_value(&ability, &get_value("application/app-x"), &mut result)
+            .unwrap();
+        server.join().unwrap();
+        assert!(matches!(
+            &result[0],
+            Val::Variant(case, Some(payload))
+                if case == "found"
+                    && matches!(payload.as_ref(), Val::Record(fields)
+                        if matches!(fields.last(), Some((name, Val::S64(7)))
+                            if name == "version"))
+        ));
+        assert_eq!(session.events.len(), 1);
     }
 
     #[test]
