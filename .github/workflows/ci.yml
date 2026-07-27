@@ -102,7 +102,7 @@ jobs:
       - name: Compile the typed v0.3 Component
         run: |
           git clone https://github.com/kotoba-lang/compiler.git ../compiler
-          git -C ../compiler checkout --detach eec7e153719358d5bd7cbbeb5a174cd5f14642a4
+          git -C ../compiler checkout --detach 1d46076d4adba9979aa867a7826ebba8e3421e6a
           (
             cd ../compiler
             clojure -M -m kotoba.compiler.cli compile \

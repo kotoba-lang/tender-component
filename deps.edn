@@ -11,7 +11,7 @@
           {:git/tag "v0.5.1" :git/sha "dfb30dd"}
           io.github.kotoba-lang/compiler
           {:git/url "https://github.com/kotoba-lang/compiler.git"
-           :git/sha "bcf99d6a694b58f10e7d24be0b726840db6b7e57"}
+           :git/sha "1d46076d4adba9979aa867a7826ebba8e3421e6a"}
           io.github.kotoba-lang/abi
           {:git/url "https://github.com/kotoba-lang/abi.git"
            :git/sha "6b2e5185ff98aa9cfec3f371a019e75b4c089aae"}
