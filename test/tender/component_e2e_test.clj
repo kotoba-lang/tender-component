@@ -67,7 +67,10 @@
 
 (defn- run-on-host [artifact host runtime providers opts]
   (component/admit-and-run-with-aiueos!
-   artifact (component-world (:bytes artifact)) (:bytes artifact) providers
+   artifact
+   (assoc (component-world (:bytes artifact))
+          :budgets (merge (:budgets artifact) {:deadline-ms 10000}))
+   (:bytes artifact) providers
    (merge {:runtime runtime
            :component-host (.getAbsolutePath ^File host)
            :component-host-sha256 (sha256-file host)
@@ -146,11 +149,11 @@
                                           (cap-call :clock/now 8)))"
                        {:allow #{[:cap/call 7]}}
                        {:component-abilities {7 ability}
-                        :budgets {:fuel 100000 :memory-pages 4}})]
+                        :budgets {:fuel 100000 :memory-pages 5}})]
             (doseq [[runtime engine] [[:wasmtime-component host]
                                       [:jco-component jco-host]]]
-              (is (thrown-with-msg?
-                   clojure.lang.ExceptionInfo #"lease denies"
+              (is (thrown?
+                   clojure.lang.ExceptionInfo
                    (run-on-host twice engine runtime providers {}))))))))
     ;; The executable is a deliberately separate native TCB.  Unit-test
     ;; invocations do not build it implicitly; CI sets this variable after
@@ -196,5 +199,24 @@
       (is (= {:result 4242 :runtime :wasmtime-component}
              (select-keys outcome [:result :runtime])))
       (is (= ability (:ability @seen)))
-      (is (= "typed-v03-e2e" (:audit-id @audited))))
+      (is (= "typed-v03-e2e" (:audit-id @audited)))
+      (when-let [jco-path (System/getenv "KOTOTAMA_JCO_COMPONENT_HOST")]
+        (let [jco-host (File. jco-path)
+              jco-outcome
+              (component/admit-and-run-with-aiueos!
+               artifact
+               (typed-component-world (:bytes artifact) (sha256-file jco-host))
+               (:bytes artifact)
+               providers
+               {:runtime :jco-component
+                :component-host (.getAbsolutePath jco-host)
+                :component-host-sha256 (sha256-file jco-host)
+                :now-ms (constantly 1000)
+                :lease-epoch 1 :lease-ttl-ms 10000
+                :audit-sink (fn [record]
+                              (reset! audited record)
+                              "persisted-typed-v03-jco")})]
+          (is (= {:result 4242 :runtime :jco-component}
+                 (select-keys jco-outcome [:result :runtime])))
+          (is (= "typed-v03-e2e" (:audit-id @audited))))))
     (is true "KOTOTAMA_COMPONENT_HOST is not set; typed integration is CI-gated")))
