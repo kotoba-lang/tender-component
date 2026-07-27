@@ -955,8 +955,30 @@ impl EffectSession {
         let text = response
             .get("response")
             .and_then(Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-            .ok_or_else(|| anyhow!("LLM provider returned no bounded text result"))?;
+            .filter(|text| !text.trim().is_empty());
+        let Some(text) = text else {
+            results[0] = Val::Variant(
+                "error".into(),
+                Some(Box::new(Val::Record(vec![
+                    ("code".into(), Val::String("llm/empty-output".into())),
+                    (
+                        "message".into(),
+                        Val::String("LLM provider returned no text".into()),
+                    ),
+                    ("retryable".into(), Val::Bool(true)),
+                ]))),
+            );
+            self.events.push(json!({
+                "ability-audit-id": ability.audit_id,
+                "at-ms": now_ms()?,
+                "capability": "aiueos-llm-generate",
+                "model": model,
+                "outcome": "empty-output",
+                "response-bytes": response_bytes,
+                "target": ability.target
+            }));
+            return Ok(());
+        };
         if text.len() > llm.max_response_bytes.min(ability.max_bytes) as usize {
             bail!("LLM provider text exceeds its admitted byte bound");
         }
