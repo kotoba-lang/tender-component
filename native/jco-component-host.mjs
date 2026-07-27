@@ -51,6 +51,11 @@ const supported = Object.freeze({
     specifier: 'aiueos:capability/http',
     exportName: 'getStream',
   },
+  'aiueos-object-get-stream': {
+    operation: 'object/get-stream',
+    specifier: 'aiueos:capability/object-store',
+    exportName: 'getStream',
+  },
 });
 
 function validateAbility(name, ability) {
@@ -237,7 +242,8 @@ export function append(grant, request) {
 `;
 }
 
-function typedHttpStreamSource(name, ability, lease) {
+function typedStreamSource(name, ability, lease) {
+  const objectStore = name === 'aiueos-object-get-stream';
   return `
 import { readSync, writeSync } from 'node:fs';
 import { Grant, BytesTask } from './provider-capability.js';
@@ -256,14 +262,18 @@ function line() {
 export function getStream(grant, request) {
   if (!(grant instanceof Grant) || grant.operation !== ${JSON.stringify(ability.operation)})
     throw 'provider-failed';
-  if (!request || typeof request.path !== 'string' || !Array.isArray(request.headers))
+  if (!request || ${objectStore
+    ? "typeof request.key !== 'string'"
+    : "typeof request.path !== 'string' || !Array.isArray(request.headers)"})
     throw 'provider-failed';
   calls += 1;
   if (calls > ${JSON.stringify(ability['max-items'])}) throw 'quota';
   writeSync(1, JSON.stringify({
     type: 'provider-call', import: ${JSON.stringify(name)},
     ability: ${JSON.stringify(ability)},
-    payload: { path: request.path, headers: request.headers }
+    payload: ${objectStore
+      ? "{ key: request.key }"
+      : "{ path: request.path, headers: request.headers }"}
   }) + '\\n');
   const response = JSON.parse(line());
   const proof = response['lease-proof'];
@@ -303,7 +313,8 @@ async function run(request) {
       if (typed) {
         if (item.name !== 'aiueos-clock-now' &&
             item.name !== 'aiueos-log-append' &&
-            item.name !== 'aiueos-http-get-stream')
+            item.name !== 'aiueos-http-get-stream' &&
+            item.name !== 'aiueos-object-get-stream')
           throw new Error(`typed jco host does not implement ${item.name}`);
         const capabilityProvider = 'provider-capability.js';
         const typedProvider =
@@ -315,9 +326,10 @@ async function run(request) {
             ? { file: 'provider-log.js', specifier: 'aiueos:capability/log',
                 request: 'log-append',
                 source: typedLogSource(item.name, item.ability, request.lease) }
-            : { file: 'provider-http.js', specifier: 'aiueos:capability/http',
-                request: 'http-get-stream',
-                source: typedHttpStreamSource(item.name, item.ability, request.lease) };
+            : { file: 'provider-stream.js', specifier: binding.specifier,
+                request: item.name === 'aiueos-http-get-stream'
+                  ? 'http-get-stream' : 'object-get-stream',
+                source: typedStreamSource(item.name, item.ability, request.lease) };
         writeFileSync(join(dir, capabilityProvider),
                       typedCapabilitySource(item.ability, typedProvider.request));
         writeFileSync(join(dir, typedProvider.file), typedProvider.source);
