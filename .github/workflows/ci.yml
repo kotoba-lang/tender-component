@@ -111,7 +111,7 @@ jobs:
       - name: Compile the typed v0.3 Component
         run: |
           git clone https://github.com/kotoba-lang/compiler.git ../compiler
-          git -C ../compiler checkout --detach 1d46076d4adba9979aa867a7826ebba8e3421e6a
+          git -C ../compiler checkout --detach 6bf674be1b625baf2f1487f485ece8e1129951f6
           (
             cd ../compiler
             clojure -M -m kotoba.compiler.cli compile \
@@ -186,6 +186,13 @@ jobs:
               --target wasm-component-kotoba-v2 \
               --policy "$GITHUB_WORKSPACE/qualification/workerd-object-cas-policy.edn" \
               --output "$GITHUB_WORKSPACE/qualification/workerd-object-cas.component.wasm"
+            for operation in identity-sign identity-verify hash http-post log-read; do
+              clojure -M -m kotoba.compiler.cli compile \
+                "$GITHUB_WORKSPACE/qualification/workerd-$operation-component.kotoba" \
+                --target wasm-component-kotoba-v2 \
+                --policy "$GITHUB_WORKSPACE/qualification/workerd-$operation-policy.edn" \
+                --output "$GITHUB_WORKSPACE/qualification/workerd-$operation.component.wasm"
+            done
           )
           npx jco transpile qualification/workerd-object-get.component.wasm \
             -o qualification/workerd-object/get --name component \
@@ -196,13 +203,29 @@ jobs:
           npx jco transpile qualification/workerd-object-cas.component.wasm \
             -o qualification/workerd-object/cas --name component \
             --no-typescript --quiet -I sync
+          npx jco transpile qualification/workerd-identity-sign.component.wasm \
+            -o qualification/workerd-object/sign --name component \
+            --no-typescript --quiet -I sync
+          npx jco transpile qualification/workerd-identity-verify.component.wasm \
+            -o qualification/workerd-object/verify --name component \
+            --no-typescript --quiet -I sync
+          npx jco transpile qualification/workerd-hash.component.wasm \
+            -o qualification/workerd-object/hash --name component \
+            --no-typescript --quiet -I sync
+          npx jco transpile qualification/workerd-http-post.component.wasm \
+            -o qualification/workerd-object/http-post --name component \
+            --no-typescript --quiet -I sync
+          npx jco transpile qualification/workerd-log-read.component.wasm \
+            -o qualification/workerd-object/log-read --name component \
+            --no-typescript --quiet -I sync
           npx workerd serve -I node_modules \
             qualification/workerd-object/workerd.capnp >/tmp/tender-workerd-object.log 2>&1 &
           workerd_pid=$!
           trap 'kill "$workerd_pid" 2>/dev/null || true' EXIT
           for attempt in $(seq 1 30); do
             if result=$(curl --fail --silent http://127.0.0.1:4176/); then
-              echo "$result" | grep 'PASS:compiler-component-jco-workerd:object-store:4,0,1'
+              echo "$result" | grep \
+                'PASS:compiler-component-jco-workerd:object-store+core:4,0,1,3,1,32,202,4'
               exit 0
             fi
             sleep 1

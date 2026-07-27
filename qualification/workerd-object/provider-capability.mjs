@@ -1,4 +1,9 @@
 const operations = Object.freeze({
+  "identity-sign": "identity/sign",
+  "identity-verify": "identity/verify",
+  "hash-sha256": "hash/sha256",
+  "http-post": "http/post",
+  "log-read": "log/read",
   "object-get-stream": "object/get-stream",
   "object-put-block": "object/put-block",
   "object-compare-and-set-ref": "object/compare-and-set-ref",

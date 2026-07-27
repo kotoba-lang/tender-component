@@ -30,6 +30,21 @@ function send(value) {
 }
 
 const supported = Object.freeze({
+  'aiueos-identity-sign': {
+    operation: 'identity/sign', specifier: 'aiueos:capability/identity', exportName: 'sign',
+  },
+  'aiueos-identity-verify': {
+    operation: 'identity/verify', specifier: 'aiueos:capability/identity', exportName: 'verify',
+  },
+  'aiueos-hash-sha256': {
+    operation: 'hash/sha256', specifier: 'aiueos:capability/hash', exportName: 'sha256',
+  },
+  'aiueos-http-post': {
+    operation: 'http/post', specifier: 'aiueos:capability/http', exportName: 'post',
+  },
+  'aiueos-log-read': {
+    operation: 'log/read', specifier: 'aiueos:capability/log', exportName: 'read',
+  },
   'aiueos-clock-now': {
     operation: 'clock/now',
     specifier: 'kotoba:application/clock',
@@ -355,6 +370,79 @@ export function ${cas ? 'compareAndSetRef' : 'putBlock'}(grant, request) {
 `;
 }
 
+function typedCoreProviderSource(name, ability, lease, binding) {
+  const kind = name;
+  return `
+import { readSync, writeSync } from 'node:fs';
+import { Grant } from './provider-capability.js';
+let buffered = '';
+let calls = 0;
+function line() {
+  for (;;) {
+    const n = buffered.indexOf('\\n');
+    if (n >= 0) { const out = buffered.slice(0, n); buffered = buffered.slice(n + 1); return out; }
+    const b = Buffer.alloc(4096);
+    const count = readSync(0, b, 0, b.length, null);
+    if (count === 0) throw new Error('provider closed protocol before responding');
+    buffered += b.subarray(0, count).toString('utf8');
+  }
+}
+export function ${binding.exportName}(grant, request) {
+  if (!(grant instanceof Grant) || grant.operation !== ${JSON.stringify(ability.operation)})
+    throw 'provider-failed';
+  calls += 1;
+  if (calls > ${JSON.stringify(ability['max-items'])}) throw 'quota';
+  const kind = ${JSON.stringify(kind)};
+  let payload;
+  if (kind === 'aiueos-http-post') {
+    if (!request || typeof request.path !== 'string' || !Array.isArray(request.headers) ||
+        !(request.body instanceof Uint8Array)) throw 'provider-failed';
+    payload = { path: request.path, headers: request.headers, body: Array.from(request.body) };
+  } else if (kind === 'aiueos-log-read') {
+    if (!request || typeof request.cursor !== 'bigint' || !Number.isSafeInteger(request.maxBytes))
+      throw 'provider-failed';
+    payload = { cursor: Number(request.cursor), 'max-bytes': request.maxBytes };
+  } else {
+    if (!request || !(request.bytes instanceof Uint8Array)) throw 'provider-failed';
+    payload = { bytes: Array.from(request.bytes) };
+  }
+  writeSync(1, JSON.stringify({
+    type: 'provider-call', import: ${JSON.stringify(name)},
+    ability: ${JSON.stringify(ability)}, payload
+  }) + '\\n');
+  const response = JSON.parse(line());
+  const proof = response['lease-proof'];
+  if (response.type !== 'provider-result' || response.import !== ${JSON.stringify(name)} ||
+      response['audit-id'] !== ${JSON.stringify(ability['audit-id'])} ||
+      typeof response['audit-receipt'] !== 'string' || response['audit-receipt'].length === 0 ||
+      !proof || proof.epoch !== ${JSON.stringify(lease.epoch)} ||
+      proof['expires-at'] !== ${JSON.stringify(lease['expires-at'])} ||
+      proof['observed-at'] < ${JSON.stringify(lease['not-before'])} ||
+      proof['observed-at'] > ${JSON.stringify(lease['expires-at'])}) throw 'provider-failed';
+  if (kind === 'aiueos-identity-verify') {
+    if (typeof response.payload !== 'boolean') throw 'provider-failed';
+    return response.payload;
+  }
+  if (kind === 'aiueos-http-post') {
+    const out = response.payload;
+    if (!out || !Number.isSafeInteger(out.status) || !Array.isArray(out.headers) ||
+        !Array.isArray(out.body)) throw 'provider-failed';
+    return { status: out.status, headers: out.headers, body: Uint8Array.from(out.body) };
+  }
+  if (kind === 'aiueos-log-read') {
+    const out = response.payload;
+    if (!out || !Number.isSafeInteger(out['next-cursor']) || !Array.isArray(out.bytes))
+      throw 'provider-failed';
+    return { nextCursor: BigInt(out['next-cursor']), bytes: Uint8Array.from(out.bytes) };
+  }
+  const bytes = response.payload && response.payload.bytes;
+  if (!Array.isArray(bytes) || bytes.length > ${JSON.stringify(ability['max-bytes'])})
+    throw 'provider-failed';
+  return { bytes: Uint8Array.from(bytes) };
+}
+`;
+}
+
 async function run(request) {
   if (request.type !== 'run') throw new Error('first protocol envelope must be a run request');
   if (!Number.isSafeInteger(request.fuel) || request.fuel <= 0 ||
@@ -373,7 +461,12 @@ async function run(request) {
       seen.add(item.name);
       const binding = validateAbility(item.name, item.ability);
       if (typed) {
-        if (item.name !== 'aiueos-clock-now' &&
+        if (item.name !== 'aiueos-identity-sign' &&
+            item.name !== 'aiueos-identity-verify' &&
+            item.name !== 'aiueos-hash-sha256' &&
+            item.name !== 'aiueos-http-post' &&
+            item.name !== 'aiueos-log-read' &&
+            item.name !== 'aiueos-clock-now' &&
             item.name !== 'aiueos-log-append' &&
             item.name !== 'aiueos-http-get-stream' &&
             item.name !== 'aiueos-object-get-stream' &&
@@ -396,10 +489,15 @@ async function run(request) {
                 request: item.name === 'aiueos-http-get-stream'
                   ? 'http-get-stream' : 'object-get-stream',
                 source: typedStreamSource(item.name, item.ability, request.lease) }
-            : { file: 'provider-object-write.js', specifier: binding.specifier,
+          : (item.name === 'aiueos-object-put-block' ||
+             item.name === 'aiueos-object-compare-and-set-ref')
+            ? { file: 'provider-object-write.js', specifier: binding.specifier,
                 request: item.name === 'aiueos-object-put-block'
                   ? 'object-put-block' : 'object-compare-and-set-ref',
-                source: typedObjectWriteSource(item.name, item.ability, request.lease) };
+                source: typedObjectWriteSource(item.name, item.ability, request.lease) }
+            : { file: 'provider-core.js', specifier: binding.specifier,
+                request: item.name.replace('aiueos-', '').replaceAll('-', '-'),
+                source: typedCoreProviderSource(item.name, item.ability, request.lease, binding) };
         writeFileSync(join(dir, capabilityProvider),
                       typedCapabilitySource(item.ability, typedProvider.request));
         writeFileSync(join(dir, typedProvider.file), typedProvider.source);
