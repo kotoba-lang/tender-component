@@ -523,3 +523,66 @@
             (is (= expected-payload (:payload @seen))))
           (is (= (:audit-id ability) (:audit-id @audited))))))
     (is true "KOTOTAMA_COMPONENT_HOST is not set; typed integration is CI-gated")))
+
+(deftest ^:integration compiler-v03-core-provider-round-trips
+  (if-let [host-path (System/getenv "KOTOTAMA_COMPONENT_HOST")]
+    (let [host (File. host-path)
+          jco (some-> (System/getenv "KOTOTAMA_JCO_COMPONENT_HOST") File.)
+          bytes-request "[:record :cap/bytes-request [[:bytes :string]]]"
+          bytes-response "[:record :cap/bytes-response [[:bytes :string]]]"
+          http-request "[:record :http/post-request [[:path :string] [:headers :vector-i64] [:body :string]]]"
+          http-response "[:record :http/post-response [[:status :i64] [:headers :vector-i64] [:body :string]]]"
+          log-request "[:record :log/read-request [[:cursor :i64] [:max-bytes :i64]]]"
+          log-response "[:record :log/read-response [[:next-cursor :i64] [:bytes :string]]]"
+          cases
+          [{:id 1 :capability :identity/sign :import :aiueos.component/aiueos-identity-sign
+            :source (str "(ns app (:capabilities #{:identity/sign}))(defn main []"
+                         "(bytes-response-byte-count (typed-cap-call :identity/sign "
+                         bytes-request " " bytes-response " (record " bytes-request " \"payload\"))))")
+            :provider-result {:bytes [1 2 3]} :expected 3}
+           {:id 2 :capability :identity/verify :import :aiueos.component/aiueos-identity-verify
+            :source (str "(ns app (:capabilities #{:identity/verify}))(defn main []"
+                         "(bool-result (typed-cap-call :identity/verify " bytes-request
+                         " :bool (record " bytes-request " \"signed\"))))")
+            :provider-result true :expected 1}
+           {:id 3 :capability :hash/sha256 :import :aiueos.component/aiueos-hash-sha256
+            :source (str "(ns app (:capabilities #{:hash/sha256}))(defn main []"
+                         "(bytes-response-byte-count (typed-cap-call :hash/sha256 "
+                         bytes-request " " bytes-response " (record " bytes-request " \"payload\"))))")
+            :provider-result {:bytes (vec (range 32))} :expected 32}
+           {:id 4 :capability :http/post :import :aiueos.component/aiueos-http-post
+            :source (str "(ns app (:capabilities #{:http/post}))(defn main []"
+                         "(http-response-status (typed-cap-call :http/post " http-request " "
+                         http-response " (record " http-request " \"/safe\" (vector-new) \"body\"))))")
+            :provider-result {:status 202 :headers [] :body []} :expected 202}
+           {:id 5 :capability :log/read :import :aiueos.component/aiueos-log-read
+            :source (str "(ns app (:capabilities #{:log/read}))(defn main []"
+                         "(log-read-byte-count (typed-cap-call :log/read " log-request " "
+                         log-response " (record " log-request " 0 128))))")
+            :provider-result {:next-cursor 4 :bytes [9 8 7 6]} :expected 4}]]
+      (doseq [{:keys [id capability import source provider-result expected]} cases]
+        (let [ability {:target (str "provider://" (name capability))
+                       :operation capability :max-bytes 65536 :max-items 1
+                       :deadline-ms 1000 :audit-id (str "core-" id)}
+              artifact (compiler/compile-component
+                        source {:allow #{[:cap/call id]}}
+                        {:target abi/component-target-v2
+                         :component-abilities {id ability}
+                         :budgets {:fuel 100000 :memory-pages 4
+                                   :deadline-ms 10000}})
+              providers {import (constantly provider-result)}
+              run-on (fn [runtime engine]
+                       (component/admit-and-run-with-aiueos!
+                        artifact
+                        (typed-component-world (:bytes artifact) (sha256-file engine))
+                        (:bytes artifact) providers
+                        {:runtime runtime
+                         :component-host (.getAbsolutePath engine)
+                         :component-host-sha256 (sha256-file engine)
+                         :policy-overlay {:aiueos/surface :cloud
+                                          :aiueos/grants {:kototama/guest #{capability}}}
+                         :now-ms (constantly 1000) :lease-epoch 1 :lease-ttl-ms 10000
+                         :audit-sink (constantly (str "persisted-core-" id))}))]
+          (is (= expected (:result (run-on :wasmtime-component host))))
+          (when jco (is (= expected (:result (run-on :jco-component jco)))))))
+    (is true "KOTOTAMA_COMPONENT_HOST is not set; typed integration is CI-gated"))))
