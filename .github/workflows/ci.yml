@@ -102,7 +102,7 @@ jobs:
       - name: Compile the typed v0.3 Component
         run: |
           git clone https://github.com/kotoba-lang/compiler.git ../compiler
-          git -C ../compiler checkout --detach 300e69ebfa0556617a2007292ff0b69ae37eb71f
+          git -C ../compiler checkout --detach 57237db2b17f98db2c1f34115cf8205cc7f4294e
           (
             cd ../compiler
             clojure -M -m kotoba.compiler.cli compile \
@@ -113,7 +113,7 @@ jobs:
           )
           component_wit=$(wasm-tools component wit qualification/workerd.component.wasm)
           echo "$component_wit" | grep 'import aiueos:capability/capability@0.3.0'
-          echo "$component_wit" | grep 'import aiueos:capability/clock@0.3.0'
+          echo "$component_wit" | grep 'import aiueos:capability/log@0.3.0'
       - name: Transpile and execute the same Component in workerd
         run: |
           npx jco transpile qualification/workerd.component.wasm \
@@ -125,7 +125,7 @@ jobs:
           trap 'kill "$workerd_pid" 2>/dev/null || true' EXIT
           for attempt in $(seq 1 30); do
             if result=$(curl --fail --silent http://127.0.0.1:4174/); then
-              echo "$result" | grep 'PASS:compiler-component-jco-workerd:4242'
+              echo "$result" | grep 'PASS:compiler-component-jco-workerd:log-append'
               exit 0
             fi
             sleep 1

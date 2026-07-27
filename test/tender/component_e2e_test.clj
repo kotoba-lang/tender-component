@@ -220,3 +220,67 @@
                  (select-keys jco-outcome [:result :runtime])))
           (is (= "typed-v03-e2e" (:audit-id @audited))))))
     (is true "KOTOTAMA_COMPONENT_HOST is not set; typed integration is CI-gated")))
+
+(deftest ^:integration compiler-v03-log-append-round-trip
+  (if-let [host-path (System/getenv "KOTOTAMA_COMPONENT_HOST")]
+    (let [host (File. host-path)
+          ability {:target "log://application" :operation :log/append
+                   :max-bytes 64 :max-items 1 :deadline-ms 1000
+                   :audit-id "typed-v03-log-e2e"}
+          artifact
+          (compiler/compile-component
+           "(ns app (:capabilities #{:log/append}))
+            (defn main []
+              (typed-cap-call :log/append :string :i64 \"安全\"))"
+           {:allow #{[:cap/call 6]}}
+           {:target abi/component-target-v2
+            :component-abilities {6 ability}
+            :budgets {:fuel 100000 :memory-pages 4 :deadline-ms 10000}})
+          seen (atom nil)
+          audited (atom nil)
+          providers
+          {:aiueos.component/aiueos-log-append
+           (fn [request]
+             (reset! seen request)
+             nil)}
+          outcome
+          (component/admit-and-run-with-aiueos!
+           artifact
+           (typed-component-world (:bytes artifact) (sha256-file host))
+           (:bytes artifact)
+           providers
+           {:runtime :wasmtime-component
+            :component-host (.getAbsolutePath host)
+            :component-host-sha256 (sha256-file host)
+            :now-ms (constantly 1000)
+            :lease-epoch 1 :lease-ttl-ms 10000
+            :audit-sink (fn [record]
+                          (reset! audited record)
+                          "persisted-typed-v03-log-e2e")})]
+      (is (= {:result 0 :runtime :wasmtime-component}
+             (select-keys outcome [:result :runtime])))
+      (is (= [229 174 137 229 133 168] (get-in @seen [:payload :bytes])))
+      (is (= ability (:ability @seen)))
+      (is (= "typed-v03-log-e2e" (:audit-id @audited)))
+      (when-let [jco-path (System/getenv "KOTOTAMA_JCO_COMPONENT_HOST")]
+        (let [jco-host (File. jco-path)
+              jco-outcome
+              (component/admit-and-run-with-aiueos!
+               artifact
+               (typed-component-world (:bytes artifact) (sha256-file jco-host))
+               (:bytes artifact)
+               providers
+               {:runtime :jco-component
+                :component-host (.getAbsolutePath jco-host)
+                :component-host-sha256 (sha256-file jco-host)
+                :now-ms (constantly 1000)
+                :lease-epoch 1 :lease-ttl-ms 10000
+                :audit-sink (fn [record]
+                              (reset! audited record)
+                              "persisted-typed-v03-log-jco")})]
+          (is (= {:result 0 :runtime :jco-component}
+                 (select-keys jco-outcome [:result :runtime])))
+          (is (= [229 174 137 229 133 168]
+                 (get-in @seen [:payload :bytes])))
+          (is (= "typed-v03-log-e2e" (:audit-id @audited))))))
+    (is true "KOTOTAMA_COMPONENT_HOST is not set; typed integration is CI-gated")))

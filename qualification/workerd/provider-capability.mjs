@@ -1,4 +1,4 @@
-const admittedOperation = "clock/now";
+const admittedOperation = "log/append";
 let issued = false;
 
 export class Grant {
@@ -10,6 +10,6 @@ export class Grant {
 }
 
 export function acquire(request) {
-  if (request !== "clock-now") throw "provider-failed";
+  if (request !== "log-append") throw "provider-failed";
   return new Grant(admittedOperation);
 }
