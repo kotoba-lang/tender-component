@@ -11,8 +11,13 @@ stdio are exposed.
 The bundled Rust micro-TCB uses Wasmtime with a minimal feature set. Other
 engines may implement the same host protocol without entering `kototama` core.
 
+The same native binary has a provider-free resident mode for murakumo canaries.
+It binds loopback only, verifies the exact Component bytes before readiness,
+and emits node-key-signed, fsync'd execution receipts. It does not add a WASI
+linker or grant surface; effectful applications continue through Kototama and
+Aiueos's typed provider admission path.
+
 ```sh
 clojure -M:test
 cargo test --locked --manifest-path native/component-host/Cargo.toml
 ```
-

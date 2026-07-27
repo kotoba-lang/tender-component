@@ -7,3 +7,35 @@ closed aiueos WIT imports, and each is bound to a validated ability descriptor.
 The line-delimited JSON protocol is private to kototama.wasmtime-component.
 It must not be exposed as a general component runner or used to pass ambient
 environment, files, sockets, clock, random, process, or command-line access.
+
+## Resident provider-free mode
+
+`tender-component-host --serve` keeps a sealed, provider-free Component
+available on a loopback-only HTTP endpoint:
+
+- `GET /healthz` reports the exact Component CID/SHA and receipt public key.
+- `POST /v1/run` executes `main`, checks the admitted expected result, appends
+  an fsync'd Ed25519-signed receipt, and returns that receipt.
+
+The receipt envelope carries both the decoded `body` and the exact canonical
+JSON `payload` whose UTF-8 bytes are signed. Verifiers must require
+`parse(payload) == body` before checking the signature; they never need to
+reproduce a language-specific map serialization.
+
+The daemon verifies the Component SHA before binding its socket and executes it
+once before advertising readiness. It rejects non-loopback binds, request
+bodies, ambient WASI, and imported capabilities. The receipt seed is read from
+an absolute node-local file; deployments should generate it on the node and
+must not transport it from the control plane.
+
+Required environment:
+
+```text
+KOTOTAMA_COMPONENT_PATH       KOTOTAMA_COMPONENT_CID
+KOTOTAMA_COMPONENT_SHA256     KOTOTAMA_EXPECTED_RESULT
+KOTOTAMA_FUEL                 KOTOTAMA_MEMORY_PAGES
+KOTOTAMA_NODE                 KOTOTAMA_RECEIPT_SEED_PATH
+KOTOTAMA_RECEIPT_LOG
+```
+
+`KOTOTAMA_BIND_ADDR` defaults to `127.0.0.1:18901`.
