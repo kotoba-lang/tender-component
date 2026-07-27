@@ -4,3 +4,4 @@
 /target/
 /native/component-host/target/
 /web/generated/
+/qualification/workerd/generated/

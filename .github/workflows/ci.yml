@@ -81,3 +81,54 @@ jobs:
             --virtual-time-budget=15000 --dump-dom \
             http://127.0.0.1:4173/verify-component-browser.html)
           echo "$result" | grep 'PASS:compiler-component-jco-chromium:42'
+  workerd-component:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: DeLaGuardo/setup-clojure@13.0
+        with:
+          cli: latest
+      - uses: bytecodealliance/actions/wasm-tools/setup@7ee36389ead2e51422087f820a7e17e39811b05f
+        with:
+          version: "1.243.0"
+      - run: npm ci
+      - name: Compile the typed v0.3 Component
+        run: |
+          git clone https://github.com/kotoba-lang/compiler.git ../compiler
+          git -C ../compiler checkout --detach 300e69ebfa0556617a2007292ff0b69ae37eb71f
+          (
+            cd ../compiler
+            clojure -M -m kotoba.compiler.cli compile \
+              "$GITHUB_WORKSPACE/qualification/workerd-component.kotoba" \
+              --target wasm-component-kotoba-v2 \
+              --policy "$GITHUB_WORKSPACE/qualification/workerd-policy.edn" \
+              --output "$GITHUB_WORKSPACE/qualification/workerd.component.wasm"
+          )
+          component_wit=$(wasm-tools component wit qualification/workerd.component.wasm)
+          echo "$component_wit" | grep 'import aiueos:capability/capability@0.3.0'
+          echo "$component_wit" | grep 'import aiueos:capability/clock@0.3.0'
+      - name: Transpile and execute the same Component in workerd
+        run: |
+          npx jco transpile qualification/workerd.component.wasm \
+            -o qualification/workerd/generated --name component \
+            --no-typescript --quiet -I sync
+          npx workerd serve -I node_modules \
+            qualification/workerd/workerd.capnp >/tmp/tender-workerd.log 2>&1 &
+          workerd_pid=$!
+          trap 'kill "$workerd_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if result=$(curl --fail --silent http://127.0.0.1:4174/); then
+              echo "$result" | grep 'PASS:compiler-component-jco-workerd:4242'
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/tender-workerd.log
+          exit 1

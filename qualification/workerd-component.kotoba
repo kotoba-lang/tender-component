@@ -1,0 +1,5 @@
+(ns qualification.workerd
+  (:capabilities #{:clock/now}))
+
+(defn main []
+  (cap-call :clock/now 0))
