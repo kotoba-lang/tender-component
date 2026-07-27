@@ -3,7 +3,7 @@
         org.clojure/data.json {:mvn/version "2.5.0"}
         io.github.kotoba-lang/kototama
         {:git/url "https://github.com/kotoba-lang/kototama.git"
-         :git/sha "40502c3cf4836c385a8399ce3e8d8e389f9a64dd"}}
+         :git/sha "faeeda914a8e3419e7c97f912ce1140a0a8ddb28"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps
@@ -14,7 +14,7 @@
            :git/sha "3a47501190d906cb0c3995025d2fe0309db47add"}
           io.github.kotoba-lang/abi
           {:git/url "https://github.com/kotoba-lang/abi.git"
-           :git/sha "57ecc60694bc6bd3dd799db02a092f14fc10cd3e"}
+           :git/sha "129b0b2fe26ddd1a3917132515bf1b903c7b763d"}
           io.github.kotoba-lang/io-multiformats
           {:git/url "https://github.com/kotoba-lang/io-multiformats.git"
            :git/sha "310724803db65840f00d2d98d7887f2b6a512bd3"}}
