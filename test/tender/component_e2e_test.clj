@@ -26,8 +26,8 @@
 (defn- component-world [bytes]
   {:target abi/component-target :wasi-version abi/wasi-version :profile :sync
    :imports #{} :exports #{:app/main} :grants #{} :provider-bindings {}
-   :abilities {} :ambient-wasi abi/ambient-wasi?
-   :budgets {:fuel 100000 :memory-pages 4 :deadline-ms 10000}
+   :abilities {} :runtime-bindings {} :ambient-wasi abi/ambient-wasi?
+   :budgets {:fuel 100000 :memory-pages 16 :deadline-ms 10000}
    :identity {:component-cid (mf/cidv1-raw bytes)
               :package-lock-cid (mf/cidv1-raw (.getBytes "e2e-lock" "UTF-8"))
               :definition-cids #{(mf/cidv1-raw (.getBytes "e2e-definition" "UTF-8"))}}})
@@ -80,6 +80,17 @@
            :now-ms 1000}
           opts)))
 
+(deftest provider-free-cloud-itonami-canary-round-trip
+  (let [artifact (compiler/compile-component
+                  "(ns cloud-itonami.cibn.resident (:export [main]))
+                   (defn main [] :i64 6419002)"
+                  {}
+                  {:budgets {:fuel 100000 :memory-pages 16}})]
+    (is (= {:result 6419002 :runtime :wasmtime-component}
+           (component/admit-and-run-provider-free!
+            (component-world (:bytes artifact))
+            (:bytes artifact))))))
+
 (deftest ^:integration compiler-component-aiueos-provider-round-trip
   (if-let [host-path (System/getenv "KOTOTAMA_COMPONENT_HOST")]
     (let [host (File. host-path)
@@ -92,7 +103,7 @@
                     {:allow #{[:cap/call 7]}}
                     {:capability-mode :linear-resource
                      :component-abilities {7 ability}
-                     :budgets {:fuel 100000 :memory-pages 4}})
+                     :budgets {:fuel 100000 :memory-pages 16}})
           seen (atom [])
           providers {:aiueos.component/aiueos-clock-now
                      (fn [{:keys [payload] :as request}]
@@ -124,7 +135,7 @@
           (is (= :linear-resource
                  (get-in jco [:receipt :capability-mode])
                  (get-in wasmtime [:receipt :capability-mode])))
-          (is (= {:fuel 100000 :memory-pages 4 :deadline-ms 10000}
+          (is (= {:fuel 100000 :memory-pages 16 :deadline-ms 10000}
                  (get-in jco [:receipt :resource-bounds]))))
         (testing "live epoch revocation denies both engines before provider execution"
           (doseq [[runtime engine] [[:wasmtime-component host]
