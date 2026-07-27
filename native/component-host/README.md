@@ -8,9 +8,9 @@ The line-delimited JSON protocol is private to kototama.wasmtime-component.
 It must not be exposed as a general component runner or used to pass ambient
 environment, files, sockets, clock, random, process, or command-line access.
 
-## Resident provider-free mode
+## Resident mode
 
-`tender-component-host --serve` keeps a sealed, provider-free Component
+`tender-component-host --serve` keeps a sealed Component
 available on a loopback-only HTTP endpoint:
 
 - `GET /healthz` reports the exact Component CID/SHA and receipt public key.
@@ -24,9 +24,15 @@ reproduce a language-specific map serialization.
 
 The daemon verifies the Component SHA before binding its socket and executes it
 once before advertising readiness. It rejects non-loopback binds, request
-bodies, ambient WASI, and imported capabilities. The receipt seed is read from
-an absolute node-local file; deployments should generate it on the node and
-must not transport it from the control plane.
+bodies, and ambient WASI. Without a capability configuration it remains
+provider-free. A SHA-pinned `kototama.resident-capabilities/v1` configuration
+may link exactly `http/post`, `storage/transact`, and `llm/generate`: endpoints
+must be literal loopback HTTP, storage is one absolute append-only fsync log,
+each capability is one-shot per execution, and every call appears in the
+signed receipt.
+
+The receipt seed is read from an absolute node-local file; deployments should
+generate it on the node and must not transport it from the control plane.
 
 Required environment:
 
@@ -39,3 +45,7 @@ KOTOTAMA_RECEIPT_LOG
 ```
 
 `KOTOTAMA_BIND_ADDR` defaults to `127.0.0.1:18901`.
+Effectful deployments additionally set both
+`KOTOTAMA_CAPABILITY_CONFIG_PATH` and
+`KOTOTAMA_CAPABILITY_CONFIG_SHA256`; an unknown configuration field or digest
+mismatch fails startup.

@@ -69,13 +69,21 @@ struct Protocol {
 
 struct State {
     protocol: Option<Arc<Mutex<Protocol>>>,
+    resident_effects: Option<Arc<Mutex<EffectSession>>>,
     limits: StoreLimits,
 }
 
 fn allowed_binding(name: &str) -> Option<(&'static str, &'static str, &'static str)> {
     match name {
+        "aiueos-http-post" => Some(("kotoba:application/http-post@1.0.0", "post", "http/post")),
         "aiueos-clock-now" => Some(("kotoba:application/clock@1.0.0", "now", "clock/now")),
         "aiueos-log-append" => Some(("kotoba:application/log@1.0.0", "append", "log/append")),
+        "aiueos-llm-generate" => Some(("kotoba:application/llm@1.0.0", "generate", "llm/generate")),
+        "aiueos-storage-transact" => Some((
+            "kotoba:application/storage@1.0.0",
+            "transact",
+            "storage/transact",
+        )),
         _ => None,
     }
 }
@@ -108,10 +116,15 @@ fn send(protocol: &mut Protocol, value: &Value) -> Result<()> {
 fn provider_call(state: &mut State, name: &str, ability: &Ability, value: i64) -> Result<i64> {
     // The descriptor is captured while linking, never supplied by the guest.
     validate_ability(name, ability)?;
-    let protocol = state
-        .protocol
-        .as_ref()
-        .ok_or_else(|| anyhow!("resident provider-free host has no provider protocol"))?;
+    if let Some(effects) = state.resident_effects.as_ref() {
+        return effects
+            .lock()
+            .map_err(|_| anyhow!("resident effect session lock poisoned"))?
+            .invoke(name, ability, value);
+    }
+    let protocol = state.protocol.as_ref().ok_or_else(|| {
+        anyhow!("Component requested a capability but no admitted provider is installed")
+    })?;
     let mut protocol = protocol
         .lock()
         .map_err(|_| anyhow!("protocol lock poisoned"))?;
@@ -148,7 +161,11 @@ fn wasmtime_result<T>(result: std::result::Result<T, wasmtime::Error>, context: 
     result.map_err(|error| anyhow!("{context}: {error}"))
 }
 
-fn run(request: Run, protocol: Option<Arc<Mutex<Protocol>>>) -> Result<i64> {
+fn run(
+    request: Run,
+    protocol: Option<Arc<Mutex<Protocol>>>,
+    resident_effects: Option<Arc<Mutex<EffectSession>>>,
+) -> Result<i64> {
     if request.kind != "run" {
         bail!("first protocol envelope must be a run request");
     }
@@ -171,7 +188,14 @@ fn run(request: Run, protocol: Option<Arc<Mutex<Protocol>>>) -> Result<i64> {
     let limits = StoreLimitsBuilder::new()
         .memory_size(request.memory_pages.saturating_mul(65536) as usize)
         .build();
-    let mut store = Store::new(&engine, State { protocol, limits });
+    let mut store = Store::new(
+        &engine,
+        State {
+            protocol,
+            resident_effects,
+            limits,
+        },
+    );
     store.limiter(|state| &mut state.limits);
     wasmtime_result(store.set_fuel(request.fuel), "cannot set Component fuel")?;
 
@@ -214,7 +238,17 @@ fn run(request: Run, protocol: Option<Arc<Mutex<Protocol>>>) -> Result<i64> {
                 instance.func_wrap(function, move |mut cx, (value,): (i64,)| {
                     provider_call(cx.data_mut(), &import_name, &ability, value)
                         .map(|result| (result,))
-                        .map_err(|error| wasmtime::Error::msg(error.to_string()))
+                        .map_err(|error| {
+                            eprintln!(
+                                "{}",
+                                json!({
+                                    "capability": import_name,
+                                    "error": error.to_string(),
+                                    "type": "provider-error"
+                                })
+                            );
+                            wasmtime::Error::msg(error.to_string())
+                        })
                 }),
                 "cannot bind admitted Component import",
             )?;
@@ -238,6 +272,316 @@ fn run(request: Run, protocol: Option<Arc<Mutex<Protocol>>>) -> Result<i64> {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct HttpCapability {
+    endpoint: String,
+    request_body: Value,
+    request_code: i64,
+    max_response_bytes: u64,
+    deadline_ms: u64,
+    audit_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct StorageCapability {
+    log: PathBuf,
+    max_write_bytes: u64,
+    deadline_ms: u64,
+    audit_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct LlmCapability {
+    endpoint: String,
+    model: String,
+    prompt: String,
+    success_code: i64,
+    max_request_bytes: u64,
+    max_response_bytes: u64,
+    deadline_ms: u64,
+    audit_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct ResidentCapabilityConfig {
+    format: String,
+    http: HttpCapability,
+    storage: StorageCapability,
+    llm: LlmCapability,
+}
+
+#[derive(Debug)]
+struct EffectSession {
+    config: Arc<ResidentCapabilityConfig>,
+    http_response: Option<Value>,
+    http_result: Option<i64>,
+    stored_bytes: Option<i64>,
+    events: Vec<Value>,
+}
+
+fn loopback_endpoint(url: &str) -> Result<(SocketAddr, String)> {
+    let rest = url
+        .strip_prefix("http://127.0.0.1:")
+        .ok_or_else(|| anyhow!("resident capability endpoint must use literal loopback HTTP"))?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((port, suffix)) => (port, format!("/{suffix}")),
+        None => (rest, "/".into()),
+    };
+    let port = authority
+        .parse::<u16>()
+        .context("resident capability endpoint has an invalid port")?;
+    if port == 0 {
+        bail!("resident capability endpoint port must be positive");
+    }
+    Ok((SocketAddr::from(([127, 0, 0, 1], port)), path))
+}
+
+fn decode_chunked(input: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    let mut cursor = 0usize;
+    let mut output = Vec::new();
+    loop {
+        let line_end = input[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|position| cursor + position)
+            .ok_or_else(|| anyhow!("chunked response has an incomplete size line"))?;
+        let size_text = std::str::from_utf8(&input[cursor..line_end])
+            .context("chunked response size is not UTF-8")?;
+        let size =
+            usize::from_str_radix(size_text.split(';').next().unwrap_or_default().trim(), 16)
+                .context("chunked response has an invalid size")?;
+        cursor = line_end + 2;
+        if size == 0 {
+            return Ok(output);
+        }
+        if size > max_bytes.saturating_sub(output.len())
+            || cursor.saturating_add(size).saturating_add(2) > input.len()
+        {
+            bail!("chunked response exceeds its admitted byte bound");
+        }
+        output.extend_from_slice(&input[cursor..cursor + size]);
+        cursor += size;
+        if input.get(cursor..cursor + 2) != Some(b"\r\n") {
+            bail!("chunked response is missing a chunk terminator");
+        }
+        cursor += 2;
+    }
+}
+
+fn post_loopback_json(
+    endpoint: &str,
+    body: &Value,
+    deadline_ms: u64,
+    max_response_bytes: u64,
+) -> Result<(Value, usize)> {
+    if deadline_ms == 0 || max_response_bytes == 0 {
+        bail!("resident capability HTTP bounds must be positive");
+    }
+    let (address, path) = loopback_endpoint(endpoint)?;
+    let timeout = std::time::Duration::from_millis(deadline_ms);
+    let mut stream = TcpStream::connect_timeout(&address, timeout)
+        .with_context(|| format!("cannot connect to admitted endpoint {endpoint}"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let payload = serde_json::to_vec(body)?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        address.port(),
+        payload.len()
+    )?;
+    stream.write_all(&payload)?;
+    stream.flush()?;
+
+    let hard_limit = usize::try_from(max_response_bytes)
+        .unwrap_or(usize::MAX)
+        .saturating_add(16 * 1024);
+    let mut response = Vec::new();
+    stream
+        .take(hard_limit.saturating_add(1) as u64)
+        .read_to_end(&mut response)?;
+    if response.len() > hard_limit {
+        bail!("resident capability response exceeds its admitted byte bound");
+    }
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| anyhow!("resident capability returned an invalid HTTP response"))?;
+    let headers = std::str::from_utf8(&response[..split])
+        .context("resident capability HTTP headers are not UTF-8")?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("resident capability returned an invalid HTTP status"))?;
+    if !(200..300).contains(&status) {
+        bail!("resident capability endpoint returned HTTP {status}");
+    }
+    let chunked = headers
+        .lines()
+        .any(|line| line.to_ascii_lowercase().trim() == "transfer-encoding: chunked");
+    let raw_body = &response[split + 4..];
+    let decoded_chunked = chunked
+        .then(|| decode_chunked(raw_body, max_response_bytes as usize))
+        .transpose()?;
+    let body = decoded_chunked.as_deref().unwrap_or(raw_body);
+    if body.len() > max_response_bytes as usize {
+        bail!("resident capability response body exceeds its admitted byte bound");
+    }
+    let decoded =
+        serde_json::from_slice(body).context("resident capability response body is not JSON")?;
+    Ok((decoded, body.len()))
+}
+
+fn append_json_line(path: &Path, value: &Value, max_bytes: u64) -> Result<usize> {
+    if !path.is_absolute() || max_bytes == 0 {
+        bail!("resident storage capability requires an absolute bounded log");
+    }
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    if bytes.len() > max_bytes as usize {
+        bail!("resident storage write exceeds its admitted byte bound");
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("cannot open admitted storage log {}", path.display()))?;
+    file.write_all(&bytes)?;
+    file.flush()?;
+    file.sync_data()?;
+    Ok(bytes.len())
+}
+
+impl EffectSession {
+    fn new(config: Arc<ResidentCapabilityConfig>) -> Self {
+        Self {
+            config,
+            http_response: None,
+            http_result: None,
+            stored_bytes: None,
+            events: Vec::new(),
+        }
+    }
+
+    fn event(
+        &mut self,
+        capability: &str,
+        ability: &Ability,
+        request: i64,
+        result: i64,
+        response_bytes: usize,
+    ) -> Result<()> {
+        self.events.push(json!({
+            "ability-audit-id": ability.audit_id,
+            "at-ms": now_ms()?,
+            "capability": capability,
+            "request": request,
+            "response-bytes": response_bytes,
+            "result": result,
+            "target": ability.target
+        }));
+        Ok(())
+    }
+
+    fn invoke(&mut self, name: &str, ability: &Ability, value: i64) -> Result<i64> {
+        match name {
+            "aiueos-http-post" => {
+                if value != self.config.http.request_code {
+                    bail!("HTTP capability request code is outside the admitted operation");
+                }
+                let (response, response_bytes) = post_loopback_json(
+                    &self.config.http.endpoint,
+                    &self.config.http.request_body,
+                    self.config.http.deadline_ms,
+                    self.config.http.max_response_bytes,
+                )?;
+                let result = i64::try_from(response_bytes)
+                    .context("HTTP response length does not fit the scalar Component ABI")?;
+                self.http_response = Some(response);
+                self.http_result = Some(result);
+                self.event(name, ability, value, result, response_bytes)?;
+                Ok(result)
+            }
+            "aiueos-storage-transact" => {
+                let response = self
+                    .http_response
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("storage capability requires a prior HTTP result"))?;
+                if self.http_result != Some(value) {
+                    bail!("storage capability input does not match the prior HTTP result");
+                }
+                let record = json!({
+                    "format": "cloud-itonami.effect-checkpoint/v1",
+                    "http-response": response,
+                    "recorded-at-ms": now_ms()?
+                });
+                let written = append_json_line(
+                    &self.config.storage.log,
+                    &record,
+                    self.config.storage.max_write_bytes,
+                )?;
+                let result = i64::try_from(written)
+                    .context("storage write length does not fit the scalar Component ABI")?;
+                self.stored_bytes = Some(result);
+                self.event(name, ability, value, result, written)?;
+                Ok(result)
+            }
+            "aiueos-llm-generate" => {
+                if self.stored_bytes != Some(value) {
+                    bail!("LLM capability input does not match the durable checkpoint");
+                }
+                let context = self
+                    .http_response
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("LLM capability requires a prior HTTP result"))?;
+                let prompt = format!(
+                    "{}\n\nBounded provider context:\n{}",
+                    self.config.llm.prompt,
+                    serde_json::to_string(context)?
+                );
+                if prompt.as_bytes().len() > self.config.llm.max_request_bytes as usize {
+                    bail!("LLM request exceeds its admitted byte bound");
+                }
+                let request = json!({
+                    "model": self.config.llm.model,
+                    "prompt": prompt,
+                    "stream": false
+                });
+                let (response, response_bytes) = post_loopback_json(
+                    &self.config.llm.endpoint,
+                    &request,
+                    self.config.llm.deadline_ms,
+                    self.config.llm.max_response_bytes,
+                )?;
+                let generated = response
+                    .get("response")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .ok_or_else(|| anyhow!("LLM provider returned no bounded text result"))?;
+                let result = self.config.llm.success_code;
+                self.event(
+                    name,
+                    ability,
+                    value,
+                    result,
+                    generated.as_bytes().len().min(response_bytes),
+                )?;
+                Ok(result)
+            }
+            _ => bail!("resident provider does not implement capability {name}"),
+        }
+    }
+}
+
 struct ResidentConfig {
     bind: SocketAddr,
     component: PathBuf,
@@ -249,6 +593,8 @@ struct ResidentConfig {
     node: String,
     receipt_log: PathBuf,
     signing_key: SigningKey,
+    capabilities: Option<Arc<ResidentCapabilityConfig>>,
+    capability_config_sha256: Option<String>,
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -286,6 +632,89 @@ fn read_signing_key(path: &Path) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&seed))
 }
 
+fn read_capability_config() -> Result<Option<(Arc<ResidentCapabilityConfig>, String)>> {
+    let path = match env::var("KOTOTAMA_CAPABILITY_CONFIG_PATH") {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => return Ok(None),
+    };
+    if !path.is_absolute() || !path.is_file() {
+        bail!("KOTOTAMA_CAPABILITY_CONFIG_PATH must be an absolute file");
+    }
+    let expected_sha256 = required_env("KOTOTAMA_CAPABILITY_CONFIG_SHA256")?;
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("KOTOTAMA_CAPABILITY_CONFIG_SHA256 must be lowercase SHA-256 hex");
+    }
+    if sha256_file(&path)? != expected_sha256 {
+        bail!("resident capability configuration does not match its admitted SHA-256");
+    }
+    let config: ResidentCapabilityConfig = serde_json::from_slice(
+        &fs::read(&path)
+            .with_context(|| format!("cannot read capability config {}", path.display()))?,
+    )
+    .context("resident capability configuration is invalid")?;
+    if config.format != "kototama.resident-capabilities/v1" {
+        bail!("resident capability configuration format is unsupported");
+    }
+    loopback_endpoint(&config.http.endpoint)?;
+    loopback_endpoint(&config.llm.endpoint)?;
+    if !config.storage.log.is_absolute()
+        || config.http.audit_id.is_empty()
+        || config.storage.audit_id.is_empty()
+        || config.llm.audit_id.is_empty()
+        || config.llm.model.is_empty()
+        || config.llm.prompt.is_empty()
+        || config.http.max_response_bytes == 0
+        || config.http.deadline_ms == 0
+        || config.storage.max_write_bytes == 0
+        || config.storage.deadline_ms == 0
+        || config.llm.max_request_bytes == 0
+        || config.llm.max_response_bytes == 0
+        || config.llm.deadline_ms == 0
+    {
+        bail!("resident capability configuration contains an unbounded field");
+    }
+    Ok(Some((Arc::new(config), expected_sha256)))
+}
+
+fn resident_imports(config: &ResidentCapabilityConfig) -> Vec<Import> {
+    vec![
+        Import {
+            name: "aiueos-http-post".into(),
+            ability: Ability {
+                target: config.http.endpoint.clone(),
+                operation: "http/post".into(),
+                max_bytes: config.http.max_response_bytes,
+                max_items: 1,
+                deadline_ms: config.http.deadline_ms,
+                audit_id: config.http.audit_id.clone(),
+            },
+        },
+        Import {
+            name: "aiueos-storage-transact".into(),
+            ability: Ability {
+                target: config.storage.log.to_string_lossy().into_owned(),
+                operation: "storage/transact".into(),
+                max_bytes: config.storage.max_write_bytes,
+                max_items: 1,
+                deadline_ms: config.storage.deadline_ms,
+                audit_id: config.storage.audit_id.clone(),
+            },
+        },
+        Import {
+            name: "aiueos-llm-generate".into(),
+            ability: Ability {
+                target: config.llm.endpoint.clone(),
+                operation: "llm/generate".into(),
+                max_bytes: config.llm.max_response_bytes,
+                max_items: 1,
+                deadline_ms: config.llm.deadline_ms,
+                audit_id: config.llm.audit_id.clone(),
+            },
+        },
+    ]
+}
+
 fn resident_config() -> Result<ResidentConfig> {
     let bind = env::var("KOTOTAMA_BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:18901".into())
@@ -311,6 +740,7 @@ fn resident_config() -> Result<ResidentConfig> {
     if !seed_path.is_absolute() || !receipt_log.is_absolute() {
         bail!("receipt key and log paths must be absolute");
     }
+    let capability_config = read_capability_config()?;
     Ok(ResidentConfig {
         bind,
         component,
@@ -324,6 +754,8 @@ fn resident_config() -> Result<ResidentConfig> {
         node: required_env("KOTOTAMA_NODE")?,
         receipt_log,
         signing_key: read_signing_key(&seed_path)?,
+        capabilities: capability_config.as_ref().map(|(config, _)| config.clone()),
+        capability_config_sha256: capability_config.map(|(_, digest)| digest),
     })
 }
 
@@ -365,26 +797,47 @@ fn persist_receipt(path: &Path, receipt: &Value) -> Result<()> {
 
 fn execute_resident(config: &ResidentConfig) -> Result<Value> {
     let started_at_ms = now_ms()?;
+    let effect_session = config
+        .capabilities
+        .as_ref()
+        .map(|capabilities| Arc::new(Mutex::new(EffectSession::new(capabilities.clone()))));
     let result = run(
         Run {
             kind: "run".into(),
             component: config.component.to_string_lossy().into_owned(),
             capability_mode: "function".into(),
-            imports: vec![],
+            imports: config
+                .capabilities
+                .as_deref()
+                .map(resident_imports)
+                .unwrap_or_default(),
             fuel: config.fuel,
             memory_pages: config.memory_pages,
         },
         None,
+        effect_session.clone(),
     )?;
     let finished_at_ms = now_ms()?;
     if result != config.expected_result {
         bail!("Component result does not match admitted expected result");
     }
     let public_key = hex::encode(config.signing_key.verifying_key().to_bytes());
+    let effects = effect_session
+        .map(|session| {
+            session
+                .lock()
+                .map(|state| state.events.clone())
+                .map_err(|_| anyhow!("resident effect session lock poisoned"))
+        })
+        .transpose()?
+        .unwrap_or_default();
     let body = json!({
         "ambient-wasi": false,
+        "capabilities": effects.iter().filter_map(|event| event.get("capability")).collect::<Vec<_>>(),
+        "capability-config-sha256": config.capability_config_sha256,
         "component-cid": config.component_cid,
         "component-sha256": config.component_sha256,
+        "effects": effects,
         "expected-result": config.expected_result,
         "finished-at-ms": finished_at_ms,
         "format": "kototama.component-execution-receipt/v1",
@@ -453,6 +906,12 @@ fn write_http_json(stream: &mut TcpStream, status: &str, body: &Value) -> Result
 fn health(config: &ResidentConfig) -> Value {
     json!({
         "ambient-wasi": false,
+        "capabilities": config.capabilities.as_ref().map(|_| vec![
+            "aiueos-http-post",
+            "aiueos-storage-transact",
+            "aiueos-llm-generate"
+        ]).unwrap_or_default(),
+        "capability-config-sha256": config.capability_config_sha256,
         "component-cid": config.component_cid,
         "component-sha256": config.component_sha256,
         "node": config.node,
@@ -544,6 +1003,7 @@ fn main() {
         run(
             serde_json::from_str(&line).context("invalid run envelope")?,
             Some(protocol.clone()),
+            None,
         )
     })();
     let terminal = match outcome {
@@ -593,5 +1053,56 @@ mod tests {
         let loopback = "127.0.0.1:18901".parse::<SocketAddr>().unwrap();
         assert!(!public.ip().is_loopback());
         assert!(loopback.ip().is_loopback());
+    }
+
+    #[test]
+    fn resident_effect_endpoints_are_literal_loopback_only() {
+        assert!(loopback_endpoint("http://127.0.0.1:11434/api/show").is_ok());
+        assert!(loopback_endpoint("http://localhost:11434/api/show").is_err());
+        assert!(loopback_endpoint("http://10.0.0.1:11434/api/show").is_err());
+        assert!(loopback_endpoint("https://127.0.0.1:11434/api/show").is_err());
+    }
+
+    #[test]
+    fn bounded_chunked_response_is_decoded_strictly() {
+        assert_eq!(
+            decode_chunked(b"4\r\n{\"ok\r\n7\r\n\":true}\r\n0\r\n\r\n", 32).unwrap(),
+            br#"{"ok":true}"#
+        );
+        assert!(decode_chunked(b"20\r\noversize\r\n0\r\n\r\n", 4).is_err());
+        assert!(decode_chunked(b"4\r\nno-terminator", 32).is_err());
+    }
+
+    #[test]
+    fn resident_capability_config_rejects_ambient_fields() {
+        let value = json!({
+            "format": "kototama.resident-capabilities/v1",
+            "http": {
+                "endpoint": "http://127.0.0.1:1/http",
+                "request-body": {},
+                "request-code": 1,
+                "max-response-bytes": 1,
+                "deadline-ms": 1,
+                "audit-id": "http"
+            },
+            "storage": {
+                "log": "/tmp/effects.jsonl",
+                "max-write-bytes": 1,
+                "deadline-ms": 1,
+                "audit-id": "storage"
+            },
+            "llm": {
+                "endpoint": "http://127.0.0.1:1/llm",
+                "model": "model",
+                "prompt": "prompt",
+                "success-code": 1,
+                "max-request-bytes": 1,
+                "max-response-bytes": 1,
+                "deadline-ms": 1,
+                "audit-id": "llm"
+            },
+            "filesystem": "/"
+        });
+        assert!(serde_json::from_value::<ResidentCapabilityConfig>(value).is_err());
     }
 }
