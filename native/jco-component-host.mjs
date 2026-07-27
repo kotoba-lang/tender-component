@@ -46,6 +46,11 @@ const supported = Object.freeze({
     issueName: 'issueAppend',
     executeName: 'executeAppend',
   },
+  'aiueos-http-get-stream': {
+    operation: 'http/get-stream',
+    specifier: 'aiueos:capability/http',
+    exportName: 'getStream',
+  },
 });
 
 function validateAbility(name, ability) {
@@ -123,6 +128,26 @@ function typedCapabilitySource(ability, grantRequest) {
   return `
 export class Grant {
   constructor(operation) { this.operation = operation; }
+}
+export class BytesStream {
+  constructor(bytes) { this.bytes = bytes; this.offset = 0; this.cancelled = false; }
+  read(maxBytes) {
+    if (this.cancelled || !Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw 'provider-failed';
+    const end = Math.min(this.offset + maxBytes, this.bytes.byteLength);
+    const bytes = this.bytes.slice(this.offset, end);
+    this.offset = end;
+    return { bytes, done: this.offset === this.bytes.byteLength };
+  }
+  cancel() { this.cancelled = true; }
+}
+export class BytesTask {
+  constructor(bytes) { this.bytes = bytes; this.cancelled = false; this.polled = false; }
+  poll() {
+    if (this.cancelled || this.polled) throw 'provider-failed';
+    this.polled = true;
+    return { tag: 'ready', val: new BytesStream(this.bytes) };
+  }
+  cancel() { this.cancelled = true; }
 }
 export function acquire(request) {
   if (request !== ${JSON.stringify(grantRequest)}) throw 'provider-failed';
@@ -212,6 +237,52 @@ export function append(grant, request) {
 `;
 }
 
+function typedHttpStreamSource(name, ability, lease) {
+  return `
+import { readSync, writeSync } from 'node:fs';
+import { Grant, BytesTask } from './provider-capability.js';
+let buffered = '';
+let calls = 0;
+function line() {
+  for (;;) {
+    const n = buffered.indexOf('\\n');
+    if (n >= 0) { const out = buffered.slice(0, n); buffered = buffered.slice(n + 1); return out; }
+    const b = Buffer.alloc(4096);
+    const count = readSync(0, b, 0, b.length, null);
+    if (count === 0) throw new Error('provider closed protocol before responding');
+    buffered += b.subarray(0, count).toString('utf8');
+  }
+}
+export function getStream(grant, request) {
+  if (!(grant instanceof Grant) || grant.operation !== ${JSON.stringify(ability.operation)})
+    throw 'provider-failed';
+  if (!request || typeof request.path !== 'string' || !Array.isArray(request.headers))
+    throw 'provider-failed';
+  calls += 1;
+  if (calls > ${JSON.stringify(ability['max-items'])}) throw 'quota';
+  writeSync(1, JSON.stringify({
+    type: 'provider-call', import: ${JSON.stringify(name)},
+    ability: ${JSON.stringify(ability)},
+    payload: { path: request.path, headers: request.headers }
+  }) + '\\n');
+  const response = JSON.parse(line());
+  const proof = response['lease-proof'];
+  const bytes = response.payload && response.payload.bytes;
+  if (response.type !== 'provider-result' || response.import !== ${JSON.stringify(name)} ||
+      response['audit-id'] !== ${JSON.stringify(ability['audit-id'])} ||
+      typeof response['audit-receipt'] !== 'string' || response['audit-receipt'].length === 0 ||
+      !proof || proof.epoch !== ${JSON.stringify(lease.epoch)} ||
+      proof['expires-at'] !== ${JSON.stringify(lease['expires-at'])} ||
+      proof['observed-at'] < ${JSON.stringify(lease['not-before'])} ||
+      proof['observed-at'] > ${JSON.stringify(lease['expires-at'])} ||
+      !Array.isArray(bytes) || bytes.length > ${JSON.stringify(ability['max-bytes'])} ||
+      bytes.some((value) => !Number.isSafeInteger(value) || value < 0 || value > 255))
+    throw 'provider-failed';
+  return new BytesTask(Uint8Array.from(bytes));
+}
+`;
+}
+
 async function run(request) {
   if (request.type !== 'run') throw new Error('first protocol envelope must be a run request');
   if (!Number.isSafeInteger(request.fuel) || request.fuel <= 0 ||
@@ -230,16 +301,23 @@ async function run(request) {
       seen.add(item.name);
       const binding = validateAbility(item.name, item.ability);
       if (typed) {
-        if (item.name !== 'aiueos-clock-now' && item.name !== 'aiueos-log-append')
+        if (item.name !== 'aiueos-clock-now' &&
+            item.name !== 'aiueos-log-append' &&
+            item.name !== 'aiueos-http-get-stream')
           throw new Error(`typed jco host does not implement ${item.name}`);
         const capabilityProvider = 'provider-capability.js';
-        const typedProvider = item.name === 'aiueos-clock-now'
-          ? { file: 'provider-clock.js', specifier: 'aiueos:capability/clock',
-              request: 'clock-now',
-              source: typedClockSource(item.name, item.ability, request.lease) }
-          : { file: 'provider-log.js', specifier: 'aiueos:capability/log',
-              request: 'log-append',
-              source: typedLogSource(item.name, item.ability, request.lease) };
+        const typedProvider =
+          item.name === 'aiueos-clock-now'
+            ? { file: 'provider-clock.js', specifier: 'aiueos:capability/clock',
+                request: 'clock-now',
+                source: typedClockSource(item.name, item.ability, request.lease) }
+          : item.name === 'aiueos-log-append'
+            ? { file: 'provider-log.js', specifier: 'aiueos:capability/log',
+                request: 'log-append',
+                source: typedLogSource(item.name, item.ability, request.lease) }
+            : { file: 'provider-http.js', specifier: 'aiueos:capability/http',
+                request: 'http-get-stream',
+                source: typedHttpStreamSource(item.name, item.ability, request.lease) };
         writeFileSync(join(dir, capabilityProvider),
                       typedCapabilitySource(item.ability, typedProvider.request));
         writeFileSync(join(dir, typedProvider.file), typedProvider.source);
