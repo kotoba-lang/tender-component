@@ -24,6 +24,12 @@
          (catch NumberFormatException _
            (reject :invalid-engine-output "Wasmtime did not return one i64 result")))))
 
+(defn- provider-free-argv [path]
+  ;; Wasmtime 42 parses Component invocations as expressions.  Bare `main`
+  ;; was accepted by older releases but is rejected by the qualified runtime
+  ;; pin; keep the exact CLI spelling covered by the real Component test.
+  ["wasmtime" "run" "--invoke" "main()" (str path)])
+
 (defn- sha256-file [^File file]
   (let [digest (MessageDigest/getInstance "SHA-256")]
     (with-open [input (java.io.FileInputStream. file)]
@@ -179,8 +185,7 @@
     (try
       (Files/write path component-bytes (make-array java.nio.file.OpenOption 0))
       (let [process (.start (doto (ProcessBuilder.
-                                   (into-array String ["wasmtime" "run" "--invoke" "main"
-                                                       (.toString path)]))
+                                   (into-array String (provider-free-argv path)))
                              (.redirectInput java.lang.ProcessBuilder$Redirect/PIPE)
                              (.redirectError java.lang.ProcessBuilder$Redirect/PIPE)
                              (.redirectOutput java.lang.ProcessBuilder$Redirect/PIPE)))]

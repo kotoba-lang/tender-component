@@ -13,6 +13,9 @@ jobs:
       - uses: DeLaGuardo/setup-clojure@13.0
         with:
           cli: latest
+      - uses: bytecodealliance/actions/wasmtime/setup@7ee36389ead2e51422087f820a7e17e39811b05f
+        with:
+          version: "42.0.1"
       - run: clojure -M:test
       - run: clojure -M:lint
   native-host:
