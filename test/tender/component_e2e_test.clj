@@ -375,3 +375,151 @@
           (is (= {:path "/data" :headers []} (:payload @seen)))
           (is (= "typed-v03-stream-e2e" (:audit-id @audited))))))
     (is true "KOTOTAMA_COMPONENT_HOST is not set; typed integration is CI-gated")))
+
+(deftest ^:integration compiler-v03-object-stream-resource-round-trip
+  (if-let [host-path (System/getenv "KOTOTAMA_COMPONENT_HOST")]
+    (let [host (File. host-path)
+          ability {:target "object://bucket/blocks/key"
+                   :operation :object/get-stream
+                   :max-bytes 65536 :max-items 1 :deadline-ms 1000
+                   :audit-id "typed-v03-object-stream-e2e"}
+          artifact
+          (compiler/compile-component
+           "(ns app (:capabilities #{:object/get-stream}))
+            (defn main []
+              (bytes-task-byte-count
+               (typed-cap-call :object/get-stream :string
+                 [:task [:stream :bytes]] \"blocks/key\")))"
+           {:allow #{[:cap/call 14]}}
+           {:target abi/component-target-v2
+            :profile :async
+            :component-abilities {14 ability}
+            :budgets {:fuel 100000 :memory-pages 4 :deadline-ms 10000
+                      :max-items 1 :max-bytes 65536 :cancellation true}})
+          seen (atom nil)
+          audited (atom nil)
+          providers
+          {:aiueos.component/aiueos-object-get-stream
+           (fn [request]
+             (reset! seen request)
+             {:bytes [7 8 9 10]})}
+          run-on
+          (fn [runtime engine receipt]
+            (component/admit-and-run-with-aiueos!
+             artifact
+             (assoc (typed-component-world (:bytes artifact) (sha256-file engine))
+                    :profile :async
+                    :budgets (:budgets artifact))
+             (:bytes artifact)
+             providers
+             {:runtime runtime
+              :component-host (.getAbsolutePath engine)
+              :component-host-sha256 (sha256-file engine)
+              :policy-overlay
+              {:aiueos/surface :cloud
+               :aiueos/grants
+               {:kototama/guest #{:object/get-stream}}}
+              :now-ms (constantly 1000)
+              :lease-epoch 1 :lease-ttl-ms 10000
+              :audit-sink (fn [record]
+                            (reset! audited record)
+                            receipt)}))]
+      (is (= {:result 4 :runtime :wasmtime-component}
+             (select-keys (run-on :wasmtime-component host
+                                  "persisted-object-stream-wasmtime")
+                          [:result :runtime])))
+      (is (= {:key "blocks/key"} (:payload @seen)))
+      (is (= ability (:ability @seen)))
+      (when-let [jco-path (System/getenv "KOTOTAMA_JCO_COMPONENT_HOST")]
+        (let [jco-host (File. jco-path)]
+          (is (= {:result 4 :runtime :jco-component}
+                 (select-keys
+                  (run-on :jco-component jco-host
+                          "persisted-object-stream-jco")
+                  [:result :runtime])))
+          (is (= {:key "blocks/key"} (:payload @seen)))))
+      (is (= "typed-v03-object-stream-e2e" (:audit-id @audited))))
+    (is true "KOTOTAMA_COMPONENT_HOST is not set; typed integration is CI-gated")))
+
+(deftest ^:integration compiler-v03-object-write-round-trips
+  (if-let [host-path (System/getenv "KOTOTAMA_COMPONENT_HOST")]
+    (let [host (File. host-path)
+          jco (some-> (System/getenv "KOTOTAMA_JCO_COMPONENT_HOST") File.)
+          put-type "[:record :object/put [[:key :string] [:bytes :string]]]"
+          cas-type "[:record :object/cas [[:key :string] [:expected-etag :string] [:bytes :string]]]"
+          response-type "[:record :object/cas-response [[:won :bool] [:etag :string]]]"
+          cases
+          [{:id 15
+            :capability :object/put-block
+            :import :aiueos.component/aiueos-object-put-block
+            :ability {:target "object://bucket/blocks/hash"
+                      :operation :object/put-block
+                      :max-bytes 65536 :max-items 1 :deadline-ms 1000
+                      :audit-id "typed-v03-object-put-e2e"}
+            :source (str
+                     "(ns app (:capabilities #{:object/put-block}))"
+                     "(defn main []"
+                     " (typed-cap-call :object/put-block " put-type " :i64"
+                     "  (record " put-type " \"blocks/hash\" \"payload\")))")
+            :provider-result nil
+            :expected-payload {:key "blocks/hash"
+                               :bytes [112 97 121 108 111 97 100]}
+            :expected-result 0}
+           {:id 16
+            :capability :object/compare-and-set-ref
+            :import :aiueos.component/aiueos-object-compare-and-set-ref
+            :ability {:target "object://bucket/refs/main"
+                      :operation :object/compare-and-set-ref
+                      :max-bytes 65536 :max-items 1 :deadline-ms 1000
+                      :audit-id "typed-v03-object-cas-e2e"}
+            :source (str
+                     "(ns app (:capabilities #{:object/compare-and-set-ref}))"
+                     "(defn main []"
+                     " (object-cas-won"
+                     "  (typed-cap-call :object/compare-and-set-ref "
+                     cas-type " " response-type
+                     "   (record " cas-type " \"refs/main\" \"etag-1\" \"next\"))))")
+            :provider-result {:won true :etag "etag-2"}
+            :expected-payload {:key "refs/main" :expected-etag "etag-1"
+                               :bytes [110 101 120 116]}
+            :expected-result 1}]]
+      (doseq [{:keys [id capability import ability source provider-result
+                      expected-payload expected-result]} cases]
+        (let [artifact
+              (compiler/compile-component
+               source {:allow #{[:cap/call id]}}
+               {:target abi/component-target-v2
+                :component-abilities {id ability}
+                :budgets {:fuel 100000 :memory-pages 4 :deadline-ms 10000
+                          :max-items 1 :max-bytes 65536 :cancellation true}})
+              seen (atom nil)
+              audited (atom nil)
+              providers {import (fn [request]
+                                  (reset! seen request)
+                                  provider-result)}
+              run-on
+              (fn [runtime engine]
+                (component/admit-and-run-with-aiueos!
+                 artifact
+                 (typed-component-world (:bytes artifact) (sha256-file engine))
+                 (:bytes artifact)
+                 providers
+                 {:runtime runtime
+                  :component-host (.getAbsolutePath engine)
+                  :component-host-sha256 (sha256-file engine)
+                  :policy-overlay
+                  {:aiueos/surface :cloud
+                   :aiueos/grants {:kototama/guest #{capability}}}
+                  :now-ms (constantly 1000)
+                  :lease-epoch 1 :lease-ttl-ms 10000
+                  :audit-sink (fn [record]
+                                (reset! audited record)
+                                "persisted-object-write")}))]
+          (is (= expected-result (:result (run-on :wasmtime-component host))))
+          (is (= expected-payload (:payload @seen)))
+          (is (= ability (:ability @seen)))
+          (when jco
+            (is (= expected-result (:result (run-on :jco-component jco))))
+            (is (= expected-payload (:payload @seen))))
+          (is (= (:audit-id ability) (:audit-id @audited))))))
+    (is true "KOTOTAMA_COMPONENT_HOST is not set; typed integration is CI-gated")))
