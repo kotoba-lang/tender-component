@@ -234,11 +234,36 @@ fn run(
                 "cannot bind linear capability consumer",
             )?;
         } else {
-            wasmtime_result(
-                instance.func_wrap(function, move |mut cx, (value,): (i64,)| {
-                    provider_call(cx.data_mut(), &import_name, &ability, value)
-                        .map(|result| (result,))
-                        .map_err(|error| {
+            if name == "aiueos-storage-transact" {
+                wasmtime_result(
+                    instance.func_new(function, move |mut cx, _ty, params, results| {
+                        let outcome = (|| -> Result<()> {
+                            if matches!(params, [Val::S64(_)]) {
+                                let [Val::S64(value)] = params else {
+                                    unreachable!()
+                                };
+                                provider_call(cx.data_mut(), &import_name, &ability, *value)
+                                    .and_then(|result| {
+                                        if results.len() != 1 {
+                                            bail!("storage capability must return one result");
+                                        }
+                                        results[0] = Val::S64(result);
+                                        Ok(())
+                                    })
+                            } else {
+                                let effects =
+                                    cx.data_mut().resident_effects.as_ref().ok_or_else(|| {
+                                    anyhow!(
+                                        "structured storage requires a resident admitted provider"
+                                    )
+                                })?;
+                                effects
+                                    .lock()
+                                    .map_err(|_| anyhow!("resident effect session lock poisoned"))?
+                                    .transact_value(&ability, params, results)
+                            }
+                        })();
+                        outcome.map_err(|error| {
                             eprintln!(
                                 "{}",
                                 json!({
@@ -249,9 +274,29 @@ fn run(
                             );
                             wasmtime::Error::msg(error.to_string())
                         })
-                }),
-                "cannot bind admitted Component import",
-            )?;
+                    }),
+                    "cannot bind admitted structured storage import",
+                )?;
+            } else {
+                wasmtime_result(
+                    instance.func_wrap(function, move |mut cx, (value,): (i64,)| {
+                        provider_call(cx.data_mut(), &import_name, &ability, value)
+                            .map(|result| (result,))
+                            .map_err(|error| {
+                                eprintln!(
+                                    "{}",
+                                    json!({
+                                        "capability": import_name,
+                                        "error": error.to_string(),
+                                        "type": "provider-error"
+                                    })
+                                );
+                                wasmtime::Error::msg(error.to_string())
+                            })
+                    }),
+                    "cannot bind admitted Component import",
+                )?;
+            }
         }
     }
     let instance = wasmtime_result(
@@ -461,6 +506,64 @@ fn append_json_line(path: &Path, value: &Value, max_bytes: u64) -> Result<usize>
     Ok(bytes.len())
 }
 
+fn record_string(fields: &[(String, Val)], name: &str) -> Result<String> {
+    fields
+        .iter()
+        .find_map(|(field, value)| {
+            (field == name).then(|| match value {
+                Val::String(value) => Ok(value.clone()),
+                _ => bail!("structured storage field {name} must be a string"),
+            })
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow!("structured storage record is missing field {name}"))
+}
+
+fn record_i64(fields: &[(String, Val)], name: &str) -> Result<i64> {
+    fields
+        .iter()
+        .find_map(|(field, value)| {
+            (field == name).then(|| match value {
+                Val::S64(value) => Ok(*value),
+                _ => bail!("structured storage field {name} must be s64"),
+            })
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow!("structured storage record is missing field {name}"))
+}
+
+fn conditional_values(path: &Path, max_bytes: u64) -> Result<BTreeMap<String, (String, i64)>> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > max_bytes {
+        bail!("resident structured storage namespace exceeds its admitted quota");
+    }
+    let input = fs::read_to_string(path)
+        .with_context(|| format!("cannot read admitted storage log {}", path.display()))?;
+    let mut values = BTreeMap::new();
+    for line in input.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if record.get("format").and_then(Value::as_str) != Some("kototama.conditional-value/v1") {
+            continue;
+        }
+        let Some(key) = record.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(value) = record.get("value").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(version) = record.get("version").and_then(Value::as_i64) else {
+            continue;
+        };
+        values.insert(key.to_owned(), (value.to_owned(), version));
+    }
+    Ok(values)
+}
+
 impl EffectSession {
     fn new(config: Arc<ResidentCapabilityConfig>) -> Self {
         Self {
@@ -579,6 +682,110 @@ impl EffectSession {
             }
             _ => bail!("resident provider does not implement capability {name}"),
         }
+    }
+
+    fn transact_value(
+        &mut self,
+        ability: &Ability,
+        params: &[Val],
+        results: &mut [Val],
+    ) -> Result<()> {
+        validate_ability("aiueos-storage-transact", ability)?;
+        let [Val::Variant(operation, Some(payload))] = params else {
+            bail!("structured storage requires one request variant");
+        };
+        let Val::Record(fields) = payload.as_ref() else {
+            bail!("structured storage request case requires a record payload");
+        };
+        if results.len() != 1 {
+            bail!("structured storage must return one result variant");
+        }
+        let key = record_string(fields, "key")?;
+        let value = record_string(fields, "value")?;
+        if key.is_empty()
+            || key.len() > 4096
+            || value.as_bytes().len() > self.config.storage.max_write_bytes as usize
+        {
+            bail!("structured storage request exceeds its admitted bounds");
+        }
+        let current = conditional_values(
+            &self.config.storage.log,
+            self.config.storage.max_write_bytes,
+        )?
+        .get(&key)
+        .cloned();
+        let next_version = match operation.as_str() {
+            "put-new" => match current {
+                Some((_, version)) => {
+                    results[0] = Val::Variant(
+                        "conflict-current".into(),
+                        Some(Box::new(Val::Record(vec![
+                            ("key".into(), Val::String(key.clone())),
+                            ("current-version".into(), Val::S64(version)),
+                        ]))),
+                    );
+                    return Ok(());
+                }
+                None => 1,
+            },
+            "put-existing" => {
+                let expected = record_i64(fields, "expected-version")?;
+                match current {
+                    None => {
+                        results[0] = Val::Variant(
+                            "conflict-missing".into(),
+                            Some(Box::new(Val::Bool(true))),
+                        );
+                        return Ok(());
+                    }
+                    Some((_, version)) if version != expected => {
+                        results[0] = Val::Variant(
+                            "conflict-current".into(),
+                            Some(Box::new(Val::Record(vec![
+                                ("key".into(), Val::String(key.clone())),
+                                ("current-version".into(), Val::S64(version)),
+                            ]))),
+                        );
+                        return Ok(());
+                    }
+                    Some((_, version)) => version
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("structured storage version overflow"))?,
+                }
+            }
+            _ => bail!("structured storage operation is outside the admitted subset"),
+        };
+        let record = json!({
+            "format": "kototama.conditional-value/v1",
+            "key": key,
+            "recorded-at-ms": now_ms()?,
+            "value": value,
+            "version": next_version
+        });
+        let written = append_json_line(
+            &self.config.storage.log,
+            &record,
+            self.config.storage.max_write_bytes,
+        )?;
+        results[0] = Val::Variant(
+            "written".into(),
+            Some(Box::new(Val::Record(vec![
+                ("key".into(), Val::String(key.clone())),
+                ("value".into(), Val::String(value)),
+                ("version".into(), Val::S64(next_version)),
+            ]))),
+        );
+        self.events.push(json!({
+            "ability-audit-id": ability.audit_id,
+            "at-ms": now_ms()?,
+            "capability": "aiueos-storage-transact",
+            "operation": operation,
+            "request-key": key,
+            "response-bytes": written,
+            "result-version": next_version,
+            "target": ability.target
+        }));
+        Ok(())
     }
 }
 
@@ -1020,6 +1227,68 @@ mod tests {
     use super::*;
     use ed25519_dalek::Verifier;
 
+    fn structured_session(log: PathBuf) -> EffectSession {
+        EffectSession::new(Arc::new(ResidentCapabilityConfig {
+            format: "kototama.resident-capabilities/v1".into(),
+            http: HttpCapability {
+                endpoint: "http://127.0.0.1:1/http".into(),
+                request_body: json!({}),
+                request_code: 1,
+                max_response_bytes: 1024,
+                deadline_ms: 1000,
+                audit_id: "http".into(),
+            },
+            storage: StorageCapability {
+                log,
+                max_write_bytes: 65536,
+                deadline_ms: 1000,
+                audit_id: "storage".into(),
+            },
+            llm: LlmCapability {
+                endpoint: "http://127.0.0.1:1/llm".into(),
+                model: "model".into(),
+                prompt: "prompt".into(),
+                success_code: 1,
+                max_request_bytes: 1024,
+                max_response_bytes: 1024,
+                deadline_ms: 1000,
+                audit_id: "llm".into(),
+            },
+        }))
+    }
+
+    fn storage_ability(path: &Path) -> Ability {
+        Ability {
+            target: path.to_string_lossy().into_owned(),
+            operation: "storage/transact".into(),
+            max_bytes: 65536,
+            max_items: 1,
+            deadline_ms: 1000,
+            audit_id: "order-commit".into(),
+        }
+    }
+
+    fn put_new(key: &str, value: &str) -> Vec<Val> {
+        vec![Val::Variant(
+            "put-new".into(),
+            Some(Box::new(Val::Record(vec![
+                ("key".into(), Val::String(key.into())),
+                ("value".into(), Val::String(value.into())),
+            ]))),
+        )]
+    }
+
+    fn put_existing(key: &str, value: &str, expected: i64) -> Vec<Val> {
+        vec![Val::Variant(
+            "put-existing".into(),
+            Some(Box::new(Val::Record(vec![
+                ("key".into(), Val::String(key.into())),
+                ("value".into(), Val::String(value.into())),
+                ("expected-version".into(), Val::S64(expected)),
+            ]))),
+        )]
+    }
+
     #[test]
     fn receipt_signature_covers_exact_body() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
@@ -1104,5 +1373,86 @@ mod tests {
             "filesystem": "/"
         });
         assert!(serde_json::from_value::<ResidentCapabilityConfig>(value).is_err());
+    }
+
+    #[test]
+    fn structured_storage_is_linearized_by_expected_version() {
+        let path = env::temp_dir().join(format!(
+            "tender-structured-storage-{}-{}.jsonl",
+            std::process::id(),
+            now_ms().unwrap()
+        ));
+        let ability = storage_ability(&path);
+        let mut session = structured_session(path.clone());
+        let mut result = vec![Val::Bool(false)];
+
+        session
+            .transact_value(&ability, &put_new("order/1", "v1"), &mut result)
+            .unwrap();
+        assert!(matches!(
+            &result[0],
+            Val::Variant(case, Some(payload))
+                if case == "written"
+                    && matches!(payload.as_ref(), Val::Record(fields)
+                        if matches!(fields.last(), Some((name, Val::S64(1))) if name == "version"))
+        ));
+
+        session
+            .transact_value(&ability, &put_new("order/1", "duplicate"), &mut result)
+            .unwrap();
+        assert!(matches!(
+            &result[0],
+            Val::Variant(case, Some(_)) if case == "conflict-current"
+        ));
+
+        session
+            .transact_value(&ability, &put_existing("order/1", "stale", 0), &mut result)
+            .unwrap();
+        assert!(matches!(
+            &result[0],
+            Val::Variant(case, Some(_)) if case == "conflict-current"
+        ));
+
+        session
+            .transact_value(&ability, &put_existing("order/1", "v2", 1), &mut result)
+            .unwrap();
+        assert!(matches!(
+            &result[0],
+            Val::Variant(case, Some(payload))
+                if case == "written"
+                    && matches!(payload.as_ref(), Val::Record(fields)
+                        if matches!(fields.last(), Some((name, Val::S64(2))) if name == "version"))
+        ));
+        assert_eq!(
+            conditional_values(&path, 65536).unwrap().get("order/1"),
+            Some(&("v2".into(), 2))
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn structured_replace_of_missing_value_fails_closed() {
+        let path = env::temp_dir().join(format!(
+            "tender-structured-storage-missing-{}-{}.jsonl",
+            std::process::id(),
+            now_ms().unwrap()
+        ));
+        let ability = storage_ability(&path);
+        let mut session = structured_session(path.clone());
+        let mut result = vec![Val::Bool(false)];
+        session
+            .transact_value(
+                &ability,
+                &put_existing("order/missing", "value", 1),
+                &mut result,
+            )
+            .unwrap();
+        assert!(matches!(
+            &result[0],
+            Val::Variant(case, Some(payload))
+                if case == "conflict-missing"
+                    && matches!(payload.as_ref(), Val::Bool(true))
+        ));
+        assert!(!path.exists(), "a rejected replace performs no write");
     }
 }
