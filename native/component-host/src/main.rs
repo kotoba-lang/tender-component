@@ -356,7 +356,10 @@ fn run_values(
                 "cannot bind linear capability consumer",
             )?;
         } else {
-            if name == "aiueos-storage-transact" {
+            if matches!(
+                name.as_str(),
+                "aiueos-storage-transact" | "aiueos-llm-generate"
+            ) {
                 wasmtime_result(
                     instance.func_new(function, move |mut cx, _ty, params, results| {
                         let outcome = (|| -> Result<()> {
@@ -379,10 +382,18 @@ fn run_values(
                                         "structured storage requires a resident admitted provider"
                                     )
                                 })?;
-                                effects
-                                    .lock()
-                                    .map_err(|_| anyhow!("resident effect session lock poisoned"))?
-                                    .transact_value(&ability, params, results)
+                                let mut effects = effects.lock().map_err(|_| {
+                                    anyhow!("resident effect session lock poisoned")
+                                })?;
+                                match import_name.as_str() {
+                                    "aiueos-storage-transact" => {
+                                        effects.transact_value(&ability, params, results)
+                                    }
+                                    "aiueos-llm-generate" => {
+                                        effects.generate_value(&ability, params, results)
+                                    }
+                                    _ => unreachable!(),
+                                }
                             }
                         })();
                         outcome.map_err(|error| {
@@ -397,7 +408,7 @@ fn run_values(
                             wasmtime::Error::msg(error.to_string())
                         })
                     }),
-                    "cannot bind admitted structured storage import",
+                    "cannot bind admitted structured capability import",
                 )?;
             } else {
                 wasmtime_result(
@@ -490,8 +501,10 @@ struct StorageCapability {
 struct LlmCapability {
     endpoint: String,
     model: String,
-    prompt: String,
-    success_code: i64,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    success_code: Option<i64>,
     max_request_bytes: u64,
     max_response_bytes: u64,
     deadline_ms: u64,
@@ -808,12 +821,16 @@ impl EffectSession {
                     .http_response
                     .as_ref()
                     .ok_or_else(|| anyhow!("LLM capability requires a prior HTTP result"))?;
+                let legacy_prompt = llm
+                    .prompt
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("scalar LLM capability requires a configured prompt"))?;
                 let prompt = format!(
                     "{}\n\nBounded provider context:\n{}",
-                    llm.prompt,
+                    legacy_prompt,
                     serde_json::to_string(context)?
                 );
-                if prompt.as_bytes().len() > llm.max_request_bytes as usize {
+                if prompt.len() > llm.max_request_bytes as usize {
                     bail!("LLM request exceeds its admitted byte bound");
                 }
                 let request = json!({
@@ -832,18 +849,161 @@ impl EffectSession {
                     .and_then(Value::as_str)
                     .filter(|text| !text.trim().is_empty())
                     .ok_or_else(|| anyhow!("LLM provider returned no bounded text result"))?;
-                let result = llm.success_code;
+                let result = llm
+                    .success_code
+                    .ok_or_else(|| anyhow!("scalar LLM capability requires a success code"))?;
                 self.event(
                     name,
                     ability,
                     value,
                     result,
-                    generated.as_bytes().len().min(response_bytes),
+                    generated.len().min(response_bytes),
                 )?;
                 Ok(result)
             }
             _ => bail!("resident provider does not implement capability {name}"),
         }
+    }
+
+    fn generate_value(
+        &mut self,
+        ability: &Ability,
+        params: &[Val],
+        results: &mut [Val],
+    ) -> Result<()> {
+        validate_ability("aiueos-llm-generate", ability)?;
+        let llm = self
+            .config
+            .llm
+            .as_ref()
+            .ok_or_else(|| anyhow!("LLM capability is not configured"))?;
+        let [request] = params else {
+            bail!("structured LLM requires one request");
+        };
+        let (fields, flattened_result) = match request {
+            Val::Record(fields) => (fields, false),
+            Val::Variant(case, Some(payload)) if case == "generate" => {
+                let Val::Record(fields) = payload.as_ref() else {
+                    bail!("structured LLM generate case requires a record");
+                };
+                (fields, true)
+            }
+            _ => bail!("structured LLM request is outside the admitted subset"),
+        };
+        if results.len() != 1 {
+            bail!("structured LLM must return one result variant");
+        }
+        let model = record_string(fields, "model")?;
+        let system = record_string(fields, "system")?;
+        let prompt = record_string(fields, "prompt")?;
+        let max_output_tokens = record_i64(fields, "max-output-tokens")?;
+        let temperature_milli = record_i64(fields, "temperature-milli")?;
+        if model != llm.model {
+            bail!("LLM model is outside the exact host allowlist");
+        }
+        if !(1..=4096).contains(&max_output_tokens) || !(0..=2000).contains(&temperature_milli) {
+            bail!("structured LLM request budget is outside llm-v1");
+        }
+        let combined = format!("{system}\n\n{prompt}");
+        if system.len() > 65536
+            || prompt.len() > 65536
+            || combined.len() > llm.max_request_bytes as usize
+        {
+            bail!("structured LLM request exceeds its admitted byte bound");
+        }
+        let request = json!({
+            "model": llm.model,
+            "prompt": prompt,
+            "stream": false,
+            "system": system,
+            "options": {
+                "num_predict": max_output_tokens,
+                "temperature": temperature_milli as f64 / 1000.0
+            }
+        });
+        let generated = post_loopback_json(
+            &llm.endpoint,
+            &request,
+            llm.deadline_ms.min(ability.deadline_ms),
+            llm.max_response_bytes.min(ability.max_bytes),
+        );
+        let (response, response_bytes) = match generated {
+            Ok(response) => response,
+            Err(_) => {
+                results[0] = Val::Variant(
+                    "error".into(),
+                    Some(Box::new(Val::Record(vec![
+                        ("code".into(), Val::String("llm/transport".into())),
+                        (
+                            "message".into(),
+                            Val::String("admitted LLM provider failed".into()),
+                        ),
+                        ("retryable".into(), Val::Bool(true)),
+                    ]))),
+                );
+                self.events.push(json!({
+                    "ability-audit-id": ability.audit_id,
+                    "at-ms": now_ms()?,
+                    "capability": "aiueos-llm-generate",
+                    "model": model,
+                    "outcome": "error",
+                    "target": ability.target
+                }));
+                return Ok(());
+            }
+        };
+        let text = response
+            .get("response")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| anyhow!("LLM provider returned no bounded text result"))?;
+        if text.len() > llm.max_response_bytes.min(ability.max_bytes) as usize {
+            bail!("LLM provider text exceeds its admitted byte bound");
+        }
+        let finish_reason = response
+            .get("done_reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("llm/stop");
+        let input_tokens = response
+            .get("prompt_eval_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let output_tokens = response
+            .get("eval_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let mut completion = vec![
+            ("text".into(), Val::String(text.into())),
+            ("finish-reason".into(), Val::String(finish_reason.into())),
+        ];
+        if flattened_result {
+            completion.extend([
+                ("input-tokens".into(), Val::S64(input_tokens)),
+                ("output-tokens".into(), Val::S64(output_tokens)),
+            ]);
+        } else {
+            completion.push((
+                "usage".into(),
+                Val::Record(vec![
+                    ("input-tokens".into(), Val::S64(input_tokens)),
+                    ("output-tokens".into(), Val::S64(output_tokens)),
+                ]),
+            ));
+        }
+        results[0] = Val::Variant("ok".into(), Some(Box::new(Val::Record(completion))));
+        self.events.push(json!({
+            "ability-audit-id": ability.audit_id,
+            "at-ms": now_ms()?,
+            "capability": "aiueos-llm-generate",
+            "finish-reason": finish_reason,
+            "input-tokens": input_tokens,
+            "model": model,
+            "output-tokens": output_tokens,
+            "response-bytes": response_bytes,
+            "target": ability.target
+        }));
+        Ok(())
     }
 
     fn transact_value(
@@ -869,10 +1029,7 @@ impl EffectSession {
         }
         let key = record_string(fields, "key")?;
         let value = record_string(fields, "value")?;
-        if key.is_empty()
-            || key.len() > 4096
-            || value.as_bytes().len() > storage.max_write_bytes as usize
-        {
+        if key.is_empty() || key.len() > 4096 || value.len() > storage.max_write_bytes as usize {
             bail!("structured storage request exceeds its admitted bounds");
         }
         let current = conditional_values(&storage.log, storage.max_write_bytes)?
@@ -1045,19 +1202,12 @@ fn read_capability_config() -> Result<Option<(Arc<ResidentCapabilityConfig>, Str
         loopback_endpoint(&llm.endpoint)?;
         if llm.audit_id.is_empty()
             || llm.model.is_empty()
-            || llm.prompt.is_empty()
             || llm.max_request_bytes == 0
             || llm.max_response_bytes == 0
             || llm.deadline_ms == 0
         {
             bail!("resident LLM capability contains an unbounded field");
         }
-    }
-    if config.llm.is_some() && config.http.is_none() {
-        // The current scalar LLM profile consumes the prior bounded HTTP
-        // response. Keep that coupled profile explicit until an independent
-        // structured LLM request is admitted.
-        bail!("resident scalar HTTP and LLM capabilities must be granted together");
     }
     Ok(Some((Arc::new(config), expected_sha256)))
 }
@@ -1563,8 +1713,8 @@ mod tests {
             llm: Some(LlmCapability {
                 endpoint: "http://127.0.0.1:1/llm".into(),
                 model: "model".into(),
-                prompt: "prompt".into(),
-                success_code: 1,
+                prompt: Some("prompt".into()),
+                success_code: Some(1),
                 max_request_bytes: 1024,
                 max_response_bytes: 1024,
                 deadline_ms: 1000,
@@ -1582,6 +1732,33 @@ mod tests {
             deadline_ms: 1000,
             audit_id: "order-commit".into(),
         }
+    }
+
+    fn llm_ability(endpoint: &str) -> Ability {
+        Ability {
+            target: endpoint.into(),
+            operation: "llm/generate".into(),
+            max_bytes: 65536,
+            max_items: 1,
+            deadline_ms: 1000,
+            audit_id: "commitment-advisor".into(),
+        }
+    }
+
+    fn llm_request(model: &str) -> Vec<Val> {
+        vec![Val::Variant(
+            "generate".into(),
+            Some(Box::new(Val::Record(vec![
+                ("model".into(), Val::String(model.into())),
+                (
+                    "system".into(),
+                    Val::String("Use admitted facts only.".into()),
+                ),
+                ("prompt".into(), Val::String("Draft one proposal.".into())),
+                ("max-output-tokens".into(), Val::S64(256)),
+                ("temperature-milli".into(), Val::S64(200)),
+            ]))),
+        )]
     }
 
     fn put_new(key: &str, value: &str) -> Vec<Val> {
@@ -1706,6 +1883,93 @@ mod tests {
         let imports = resident_imports(&config);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "aiueos-storage-transact");
+    }
+
+    #[test]
+    fn resident_capability_config_can_grant_structured_llm_only() {
+        let config: ResidentCapabilityConfig = serde_json::from_value(json!({
+            "format": "kototama.resident-capabilities/v1",
+            "llm": {
+                "endpoint": "http://127.0.0.1:11434/api/generate",
+                "model": "kotoba/murakumo-main",
+                "max-request-bytes": 65536,
+                "max-response-bytes": 65536,
+                "deadline-ms": 1000,
+                "audit-id": "commitment-advisor"
+            }
+        }))
+        .unwrap();
+        let imports = resident_imports(&config);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].name, "aiueos-llm-generate");
+    }
+
+    #[test]
+    fn structured_llm_returns_typed_completion_with_usage() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://127.0.0.1:{}/api/generate",
+            listener.local_addr().unwrap().port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !String::from_utf8_lossy(&request).contains("\"num_predict\":256") {
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("\"num_predict\":256"));
+            assert!(request.contains("\"system\":\"Use admitted facts only.\""));
+            let body = br#"{"response":"{:confidence 0.4}","done_reason":"stop","prompt_eval_count":12,"eval_count":5}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let mut session = EffectSession::new(Arc::new(ResidentCapabilityConfig {
+            format: "kototama.resident-capabilities/v1".into(),
+            http: None,
+            storage: None,
+            llm: Some(LlmCapability {
+                endpoint: endpoint.clone(),
+                model: "kotoba/murakumo-main".into(),
+                prompt: None,
+                success_code: None,
+                max_request_bytes: 65536,
+                max_response_bytes: 65536,
+                deadline_ms: 1000,
+                audit_id: "commitment-advisor".into(),
+            }),
+        }));
+        let mut result = vec![Val::Bool(false)];
+        session
+            .generate_value(
+                &llm_ability(&endpoint),
+                &llm_request("kotoba/murakumo-main"),
+                &mut result,
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert!(matches!(
+            &result[0],
+            Val::Variant(case, Some(payload))
+                if case == "ok"
+                    && matches!(payload.as_ref(), Val::Record(fields)
+                        if matches!(fields.first(), Some((name, Val::String(text)))
+                            if name == "text" && text == "{:confidence 0.4}")
+                        && matches!(fields.last(), Some((name, Val::S64(5)))
+                            if name == "output-tokens"))
+        ));
+        assert_eq!(session.events.len(), 1);
     }
 
     #[test]
