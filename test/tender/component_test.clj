@@ -36,3 +36,9 @@
     (is (= effective (:artifact request)))
     (is (= 64 (get-in request [:artifact :component-imports import :max-bytes])))
     (is (identical? audit-sink (:audit-sink request)))))
+
+(deftest provider-free-wasmtime-invocation-matches-qualified-runtime
+  (is (= ["wasmtime" "run" "--invoke" "main()" "/tmp/app.component.wasm"]
+         (#'component/provider-free-argv
+          (java.nio.file.Path/of "/tmp/app.component.wasm"
+                                 (make-array String 0))))))

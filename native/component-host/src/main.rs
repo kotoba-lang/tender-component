@@ -314,10 +314,10 @@ fn provider_call_typed(
         bail!("typed provider lease proof is expired, revoked, or mismatched");
     }
     if response.get("audit-id") != Some(&Value::String(ability.audit_id.clone()))
-        || !response
+        || response
             .get("audit-receipt")
             .and_then(Value::as_str)
-            .is_some_and(|receipt| !receipt.is_empty())
+            .is_none_or(|receipt| receipt.is_empty())
     {
         bail!("typed provider success requires a matching persisted audit receipt");
     }
