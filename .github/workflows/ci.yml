@@ -102,7 +102,7 @@ jobs:
       - name: Compile the typed v0.3 Component
         run: |
           git clone https://github.com/kotoba-lang/compiler.git ../compiler
-          git -C ../compiler checkout --detach 57237db2b17f98db2c1f34115cf8205cc7f4294e
+          git -C ../compiler checkout --detach 928a766e7fc63cb801d8e78cade43d2e4dcd60b7
           (
             cd ../compiler
             clojure -M -m kotoba.compiler.cli compile \
@@ -131,4 +131,30 @@ jobs:
             sleep 1
           done
           cat /tmp/tender-workerd.log
+          exit 1
+      - name: Compile and execute bounded task-stream resources in workerd
+        run: |
+          (
+            cd ../compiler
+            clojure -M -m kotoba.compiler.cli compile \
+              "$GITHUB_WORKSPACE/qualification/workerd-stream-component.kotoba" \
+              --target wasm-component-kotoba-v2 \
+              --policy "$GITHUB_WORKSPACE/qualification/workerd-stream-policy.edn" \
+              --output "$GITHUB_WORKSPACE/qualification/workerd-stream.component.wasm"
+          )
+          npx jco transpile qualification/workerd-stream.component.wasm \
+            -o qualification/workerd-stream/generated --name component \
+            --no-typescript --quiet -I sync
+          npx workerd serve -I node_modules \
+            qualification/workerd-stream/workerd.capnp >/tmp/tender-workerd-stream.log 2>&1 &
+          workerd_pid=$!
+          trap 'kill "$workerd_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if result=$(curl --fail --silent http://127.0.0.1:4175/); then
+              echo "$result" | grep 'PASS:compiler-component-jco-workerd:http-stream:6'
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/tender-workerd-stream.log
           exit 1
