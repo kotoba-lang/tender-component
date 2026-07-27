@@ -32,6 +32,17 @@
               :package-lock-cid (mf/cidv1-raw (.getBytes "e2e-lock" "UTF-8"))
               :definition-cids #{(mf/cidv1-raw (.getBytes "e2e-definition" "UTF-8"))}}})
 
+(defn- typed-component-world [bytes host-sha256]
+  {:target abi/component-target-v2 :wasi-version abi/wasi-version :profile :sync
+   :imports #{} :exports #{:app/main} :grants #{} :provider-bindings {}
+   :abilities {} :ambient-wasi abi/ambient-wasi?
+   :budgets {:fuel 100000 :memory-pages 4 :deadline-ms 10000}
+   :runtime-bindings {:component-host-sha256 host-sha256}
+   :identity {:component-cid (mf/cidv1-raw bytes)
+              :package-lock-cid (mf/cidv1-raw (.getBytes "v3-e2e-lock" "UTF-8"))
+              :definition-cids
+              #{(mf/cidv1-raw (.getBytes "v3-e2e-definition" "UTF-8"))}}})
+
 (defn- cid [text]
   (mf/cidv1-raw (.getBytes ^String text "UTF-8")))
 
@@ -145,3 +156,45 @@
     ;; invocations do not build it implicitly; CI sets this variable after
     ;; `cargo build --locked` and therefore cannot skip the integration path.
     (is true "KOTOTAMA_COMPONENT_HOST is not set; native integration test is CI-gated")))
+
+(deftest ^:integration compiler-v03-typed-provider-round-trip
+  (if-let [host-path (System/getenv "KOTOTAMA_COMPONENT_HOST")]
+    (let [host (File. host-path)
+          ability {:target "clock://monotonic" :operation :clock/now
+                   :max-bytes 64 :max-items 1 :deadline-ms 1000
+                   :audit-id "typed-v03-e2e"}
+          artifact (compiler/compile-component
+                    "(ns app (:capabilities #{:clock/now}))
+                     (defn main [] (cap-call :clock/now 0))"
+                    {:allow #{[:cap/call 7]}}
+                    {:target abi/component-target-v2
+                     :component-abilities {7 ability}
+                     :budgets {:fuel 100000 :memory-pages 4
+                               :deadline-ms 10000}})
+          seen (atom nil)
+          audited (atom nil)
+          providers
+          {:aiueos.component/aiueos-clock-now
+           (fn [request]
+             (reset! seen request)
+             4242)}
+          outcome
+          (component/admit-and-run-with-aiueos!
+           artifact
+           (typed-component-world (:bytes artifact) (sha256-file host))
+           (:bytes artifact)
+           providers
+           {:runtime :wasmtime-component
+            :component-host (.getAbsolutePath host)
+            :component-host-sha256 (sha256-file host)
+            :now-ms (constantly 1000)
+            :lease-epoch 1 :lease-ttl-ms 10000
+            :audit-sink (fn [record]
+                          (reset! audited record)
+                          "persisted-typed-v03-e2e")})]
+      (is (= abi/typed-capability-world-v3 (:component-world artifact)))
+      (is (= {:result 4242 :runtime :wasmtime-component}
+             (select-keys outcome [:result :runtime])))
+      (is (= ability (:ability @seen)))
+      (is (= "typed-v03-e2e" (:audit-id @audited))))
+    (is true "KOTOTAMA_COMPONENT_HOST is not set; typed integration is CI-gated")))

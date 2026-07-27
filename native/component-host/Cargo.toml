@@ -3,6 +3,7 @@ name = "tender-component-host"
 version = "0.1.0"
 edition = "2024"
 publish = false
+build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.100"
@@ -11,3 +12,4 @@ serde_json = "1.0.145"
 # Keep the native TCB small: no WASI, GC, cache, profiling, debugger,
 # component-async, or automatic parallel compilation surfaces.
 wasmtime = { version = "=42.0.1", default-features = false, features = ["component-model", "cranelift", "runtime"] }
+kotoba-abi-wit = { git = "https://github.com/kotoba-lang/abi.git", rev = "129b0b2fe26ddd1a3917132515bf1b903c7b763d" }
