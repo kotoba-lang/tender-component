@@ -14,7 +14,9 @@ The CI matrix also executes a compiler-produced typed v0.3 Component in the
 actual Cloudflare `workerd` binary. `jco` performs only the portable Component
 to ESM/Core Wasm adaptation; workerd remains the engine. Its worker has an
 explicit deny-all outbound service and receives only the named
-`capability.acquire` and `clock.now` providers. The same Component type is
+`capability.acquire` and `log.append` providers. The same payload-carrying
+Component is also executed through the Wasmtime and jco/Node adapters, including
+grant, lease, byte/item quota, and persistent audit-receipt checks. Its type is
 checked before transpilation so a v1 binary cannot pass under v0.3 metadata.
 
 ```sh

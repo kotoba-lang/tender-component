@@ -1,5 +1,5 @@
 (ns qualification.workerd
-  (:capabilities #{:clock/now}))
+  (:capabilities #{:log/append}))
 
 (defn main []
-  (cap-call :clock/now 0))
+  (typed-cap-call :log/append :string :i64 "安全"))

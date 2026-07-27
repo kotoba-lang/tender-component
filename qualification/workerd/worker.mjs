@@ -4,7 +4,7 @@ import core2 from "./component.core2.wasm";
 import core3 from "./component.core3.wasm";
 import core4 from "./component.core4.wasm";
 import * as capability from "./provider-capability.mjs";
-import * as clock from "./provider-clock.mjs";
+import * as log from "./provider-log.mjs";
 
 const cores = new Map([
   ["component.core.wasm", core1],
@@ -16,16 +16,16 @@ const component = instantiate(
   (name) => cores.get(name),
   {
     "aiueos:capability/capability": capability,
-    "aiueos:capability/clock": clock,
+    "aiueos:capability/log": log,
   },
 );
 
 export default {
   fetch() {
     const value = component.main();
-    if (value !== 4242n) {
+    if (value !== 0n) {
       return new Response(`FAIL:${value}`, { status: 500 });
     }
-    return new Response("PASS:compiler-component-jco-workerd:4242");
+    return new Response("PASS:compiler-component-jco-workerd:log-append");
   },
 };
