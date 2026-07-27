@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use wasmtime::component::{Component, Linker, Resource, ResourceTable, ResourceType, Val};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
@@ -99,6 +100,7 @@ pub struct BytesTask {
     bytes: Option<Vec<u8>>,
     max_bytes: u64,
     max_items: u64,
+    deadline: Instant,
     cancelled: bool,
 }
 
@@ -108,7 +110,14 @@ pub struct BytesStream {
     offset: usize,
     remaining_bytes: u64,
     remaining_items: u64,
+    deadline: Instant,
     cancelled: bool,
+}
+
+fn stream_deadline(ability: &Ability) -> Result<Instant, V2Denial> {
+    Instant::now()
+        .checked_add(Duration::from_millis(ability.deadline_ms))
+        .ok_or(V2Denial::Deadline)
 }
 
 fn issue_grant(state: &mut State, name: &str, ability: &Ability) -> Result<Resource<Grant>> {
@@ -437,21 +446,25 @@ impl v2_capability::HostBytesTask for State {
         &mut self,
         rep: Resource<BytesTask>,
     ) -> wasmtime::Result<Result<v2_capability::BytesTaskState, V2Denial>> {
-        let (bytes, max_bytes, max_items) = {
+        let (bytes, max_bytes, max_items, deadline) = {
             let task = self.grants.get_mut(&rep)?;
             if task.cancelled {
                 return Ok(Err(V2Denial::Revoked));
             }
+            if Instant::now() >= task.deadline {
+                return Ok(Err(V2Denial::Deadline));
+            }
             let Some(bytes) = task.bytes.take() else {
                 return Ok(Ok(v2_capability::BytesTaskState::Pending));
             };
-            (bytes, task.max_bytes, task.max_items)
+            (bytes, task.max_bytes, task.max_items, task.deadline)
         };
         let stream = self.grants.push(BytesStream {
             bytes,
             offset: 0,
             remaining_bytes: max_bytes,
             remaining_items: max_items,
+            deadline,
             cancelled: false,
         })?;
         Ok(Ok(v2_capability::BytesTaskState::Ready(stream)))
@@ -476,6 +489,9 @@ impl v2_capability::HostBytesStream for State {
         let stream = self.grants.get_mut(&rep)?;
         if stream.cancelled {
             return Ok(Err(V2Denial::Revoked));
+        }
+        if Instant::now() >= stream.deadline {
+            return Ok(Err(V2Denial::Deadline));
         }
         if max_bytes == 0 || stream.remaining_items == 0 {
             return Ok(Err(V2Denial::Quota));
@@ -600,6 +616,10 @@ impl v2_bindings::aiueos::capability::http::Host for State {
             Ok(ability) => ability,
             Err(error) => return Ok(Err(denial(error))),
         };
+        let deadline = match stream_deadline(&ability) {
+            Ok(deadline) => deadline,
+            Err(error) => return Ok(Err(error)),
+        };
         let payload = json!({"path": request.path, "headers": request.headers});
         let value = match typed_call(self, &authority, "aiueos-http-get-stream", payload) {
             Ok(value) => value,
@@ -615,6 +635,7 @@ impl v2_bindings::aiueos::capability::http::Host for State {
                 bytes: Some(data),
                 max_bytes: ability.max_bytes,
                 max_items: ability.max_items,
+                deadline,
                 cancelled: false,
             })
             .map_err(|_| V2Denial::ProviderFailed))
@@ -670,6 +691,10 @@ impl v2_bindings::aiueos::capability::object_store::Host for State {
             Ok(ability) => ability,
             Err(error) => return Ok(Err(denial(error))),
         };
+        let deadline = match stream_deadline(&ability) {
+            Ok(deadline) => deadline,
+            Err(error) => return Ok(Err(error)),
+        };
         let value = match typed_call(
             self,
             &authority,
@@ -689,6 +714,7 @@ impl v2_bindings::aiueos::capability::object_store::Host for State {
                 bytes: Some(data),
                 max_bytes: ability.max_bytes,
                 max_items: ability.max_items,
+                deadline,
                 cancelled: false,
             })
             .map_err(|_| V2Denial::ProviderFailed))
@@ -1021,6 +1047,7 @@ mod tests {
                 bytes: Some(vec![1, 2, 3, 4]),
                 max_bytes: 3,
                 max_items: 2,
+                deadline: Instant::now() + Duration::from_secs(1),
                 cancelled: false,
             })
             .unwrap();
@@ -1072,5 +1099,51 @@ mod tests {
             .unwrap()
             .is_err()
         );
+    }
+
+    #[test]
+    fn task_and_stream_resources_fail_closed_after_the_ability_deadline() {
+        let protocol = Arc::new(Mutex::new(Protocol {
+            input: BufReader::new(io::stdin()),
+            output: BufWriter::new(io::stdout()),
+        }));
+        let mut state = State {
+            protocol,
+            limits: StoreLimitsBuilder::new().build(),
+            grants: ResourceTable::new(),
+            calls: BTreeMap::new(),
+            admitted_imports: BTreeMap::new(),
+            lease: None,
+        };
+        let task = state
+            .grants
+            .push(BytesTask {
+                bytes: Some(vec![1]),
+                max_bytes: 1,
+                max_items: 1,
+                deadline: Instant::now(),
+                cancelled: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            <State as v2_capability::HostBytesTask>::poll(&mut state, task).unwrap(),
+            Err(V2Denial::Deadline)
+        ));
+
+        let stream = state
+            .grants
+            .push(BytesStream {
+                bytes: vec![1],
+                offset: 0,
+                remaining_bytes: 1,
+                remaining_items: 1,
+                deadline: Instant::now(),
+                cancelled: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            <State as v2_capability::HostBytesStream>::read(&mut state, stream, 1).unwrap(),
+            Err(V2Denial::Deadline)
+        ));
     }
 }

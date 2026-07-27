@@ -20,7 +20,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: DeLaGuardo/setup-clojure@13.0
+        with:
+          cli: latest
+      - uses: bytecodealliance/actions/wasm-tools/setup@7ee36389ead2e51422087f820a7e17e39811b05f
+        with:
+          version: "1.243.0"
+      - run: npm ci
       - run: cargo test --locked --manifest-path native/component-host/Cargo.toml
+      - run: cargo build --locked --manifest-path native/component-host/Cargo.toml
+      - name: Kotoba source to typed Component provider E2E
+        run: clojure -M:test
+        env:
+          KOTOTAMA_COMPONENT_HOST: ${{ github.workspace }}/native/component-host/target/debug/tender-component-host
+          KOTOTAMA_JCO_COMPONENT_HOST: ${{ github.workspace }}/native/jco-component-host.mjs
   browser-component:
     runs-on: ubuntu-latest
     steps:
