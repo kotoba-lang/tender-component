@@ -102,7 +102,7 @@ jobs:
       - name: Compile the typed v0.3 Component
         run: |
           git clone https://github.com/kotoba-lang/compiler.git ../compiler
-          git -C ../compiler checkout --detach 928a766e7fc63cb801d8e78cade43d2e4dcd60b7
+          git -C ../compiler checkout --detach eec7e153719358d5bd7cbbeb5a174cd5f14642a4
           (
             cd ../compiler
             clojure -M -m kotoba.compiler.cli compile \
@@ -157,4 +157,46 @@ jobs:
             sleep 1
           done
           cat /tmp/tender-workerd-stream.log
+          exit 1
+      - name: Compile and execute object-store providers in workerd
+        run: |
+          (
+            cd ../compiler
+            clojure -M -m kotoba.compiler.cli compile \
+              "$GITHUB_WORKSPACE/qualification/workerd-object-get-component.kotoba" \
+              --target wasm-component-kotoba-v2 \
+              --policy "$GITHUB_WORKSPACE/qualification/workerd-object-get-policy.edn" \
+              --output "$GITHUB_WORKSPACE/qualification/workerd-object-get.component.wasm"
+            clojure -M -m kotoba.compiler.cli compile \
+              "$GITHUB_WORKSPACE/qualification/workerd-object-put-component.kotoba" \
+              --target wasm-component-kotoba-v2 \
+              --policy "$GITHUB_WORKSPACE/qualification/workerd-object-put-policy.edn" \
+              --output "$GITHUB_WORKSPACE/qualification/workerd-object-put.component.wasm"
+            clojure -M -m kotoba.compiler.cli compile \
+              "$GITHUB_WORKSPACE/qualification/workerd-object-cas-component.kotoba" \
+              --target wasm-component-kotoba-v2 \
+              --policy "$GITHUB_WORKSPACE/qualification/workerd-object-cas-policy.edn" \
+              --output "$GITHUB_WORKSPACE/qualification/workerd-object-cas.component.wasm"
+          )
+          npx jco transpile qualification/workerd-object-get.component.wasm \
+            -o qualification/workerd-object/get --name component \
+            --no-typescript --quiet -I sync
+          npx jco transpile qualification/workerd-object-put.component.wasm \
+            -o qualification/workerd-object/put --name component \
+            --no-typescript --quiet -I sync
+          npx jco transpile qualification/workerd-object-cas.component.wasm \
+            -o qualification/workerd-object/cas --name component \
+            --no-typescript --quiet -I sync
+          npx workerd serve -I node_modules \
+            qualification/workerd-object/workerd.capnp >/tmp/tender-workerd-object.log 2>&1 &
+          workerd_pid=$!
+          trap 'kill "$workerd_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if result=$(curl --fail --silent http://127.0.0.1:4176/); then
+              echo "$result" | grep 'PASS:compiler-component-jco-workerd:object-store:4,0,1'
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/tender-workerd-object.log
           exit 1
