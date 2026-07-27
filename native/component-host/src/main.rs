@@ -358,7 +358,7 @@ fn run_values(
         } else {
             if matches!(
                 name.as_str(),
-                "aiueos-storage-transact" | "aiueos-llm-generate"
+                "aiueos-http-post" | "aiueos-storage-transact" | "aiueos-llm-generate"
             ) {
                 wasmtime_result(
                     instance.func_new(function, move |mut cx, _ty, params, results| {
@@ -386,6 +386,9 @@ fn run_values(
                                     anyhow!("resident effect session lock poisoned")
                                 })?;
                                 match import_name.as_str() {
+                                    "aiueos-http-post" => {
+                                        effects.post_value(&ability, params, results)
+                                    }
                                     "aiueos-storage-transact" => {
                                         effects.transact_value(&ability, params, results)
                                     }
@@ -480,8 +483,12 @@ fn run(
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct HttpCapability {
     endpoint: String,
-    request_body: Value,
-    request_code: i64,
+    #[serde(default)]
+    request_body: Option<Value>,
+    #[serde(default)]
+    request_code: Option<i64>,
+    #[serde(default)]
+    max_request_bytes: Option<u64>,
     max_response_bytes: u64,
     deadline_ms: u64,
     audit_id: String,
@@ -586,7 +593,7 @@ fn post_loopback_json(
     body: &Value,
     deadline_ms: u64,
     max_response_bytes: u64,
-) -> Result<(Value, usize)> {
+) -> Result<(u16, Value, usize)> {
     if deadline_ms == 0 || max_response_bytes == 0 {
         bail!("resident capability HTTP bounds must be positive");
     }
@@ -644,7 +651,7 @@ fn post_loopback_json(
     }
     let decoded =
         serde_json::from_slice(body).context("resident capability response body is not JSON")?;
-    Ok((decoded, body.len()))
+    Ok((status, decoded, body.len()))
 }
 
 fn append_json_line(path: &Path, value: &Value, max_bytes: u64) -> Result<usize> {
@@ -767,12 +774,16 @@ impl EffectSession {
                     .http
                     .as_ref()
                     .ok_or_else(|| anyhow!("HTTP capability is not configured"))?;
-                if value != http.request_code {
+                if Some(value) != http.request_code {
                     bail!("HTTP capability request code is outside the admitted operation");
                 }
-                let (response, response_bytes) = post_loopback_json(
+                let request_body = http
+                    .request_body
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("scalar HTTP capability requires a request body"))?;
+                let (_, response, response_bytes) = post_loopback_json(
                     &http.endpoint,
-                    &http.request_body,
+                    request_body,
                     http.deadline_ms,
                     http.max_response_bytes,
                 )?;
@@ -838,7 +849,7 @@ impl EffectSession {
                     "prompt": prompt,
                     "stream": false
                 });
-                let (response, response_bytes) = post_loopback_json(
+                let (_, response, response_bytes) = post_loopback_json(
                     &llm.endpoint,
                     &request,
                     llm.deadline_ms,
@@ -863,6 +874,92 @@ impl EffectSession {
             }
             _ => bail!("resident provider does not implement capability {name}"),
         }
+    }
+
+    fn post_value(&mut self, ability: &Ability, params: &[Val], results: &mut [Val]) -> Result<()> {
+        validate_ability("aiueos-http-post", ability)?;
+        let http = self
+            .config
+            .http
+            .as_ref()
+            .ok_or_else(|| anyhow!("HTTP capability is not configured"))?;
+        let [Val::Variant(case, Some(payload))] = params else {
+            bail!("structured HTTP requires one request variant");
+        };
+        if case != "post" {
+            bail!("structured HTTP request is outside the admitted operation");
+        }
+        let Val::Record(fields) = payload.as_ref() else {
+            bail!("structured HTTP post case requires a record");
+        };
+        if results.len() != 1 {
+            bail!("structured HTTP must return one result variant");
+        }
+        let body = record_string(fields, "body")?;
+        let timeout_ms = record_i64(fields, "timeout-ms")?;
+        let request_limit = http
+            .max_request_bytes
+            .unwrap_or(http.max_response_bytes)
+            .min(ability.max_bytes);
+        if body.len() > request_limit as usize {
+            bail!("structured HTTP request exceeds its admitted byte bound");
+        }
+        if timeout_ms <= 0 || timeout_ms as u64 > http.deadline_ms.min(ability.deadline_ms) {
+            bail!("structured HTTP timeout is outside the admitted deadline");
+        }
+        let body: Value =
+            serde_json::from_str(&body).context("structured HTTP body must be JSON")?;
+        let posted = post_loopback_json(
+            &http.endpoint,
+            &body,
+            timeout_ms as u64,
+            http.max_response_bytes.min(ability.max_bytes),
+        );
+        let (status, response, response_bytes) = match posted {
+            Ok(response) => response,
+            Err(_) => {
+                results[0] = Val::Variant(
+                    "error".into(),
+                    Some(Box::new(Val::Record(vec![
+                        ("code".into(), Val::String("http/provider-failed".into())),
+                        (
+                            "message".into(),
+                            Val::String("admitted HTTP provider failed".into()),
+                        ),
+                        ("retryable".into(), Val::Bool(true)),
+                    ]))),
+                );
+                self.events.push(json!({
+                    "ability-audit-id": ability.audit_id,
+                    "at-ms": now_ms()?,
+                    "capability": "aiueos-http-post",
+                    "outcome": "error",
+                    "target": ability.target
+                }));
+                return Ok(());
+            }
+        };
+        let response_body = serde_json::to_string(&response)?;
+        if response_body.len() > http.max_response_bytes.min(ability.max_bytes) as usize {
+            bail!("structured HTTP response exceeds its admitted byte bound");
+        }
+        results[0] = Val::Variant(
+            "ok".into(),
+            Some(Box::new(Val::Record(vec![
+                ("status".into(), Val::S64(i64::from(status))),
+                ("body".into(), Val::String(response_body)),
+            ]))),
+        );
+        self.events.push(json!({
+            "ability-audit-id": ability.audit_id,
+            "at-ms": now_ms()?,
+            "capability": "aiueos-http-post",
+            "outcome": "ok",
+            "response-bytes": response_bytes,
+            "status": status,
+            "target": ability.target
+        }));
+        Ok(())
     }
 
     fn generate_value(
@@ -927,7 +1024,7 @@ impl EffectSession {
             llm.deadline_ms.min(ability.deadline_ms),
             llm.max_response_bytes.min(ability.max_bytes),
         );
-        let (response, response_bytes) = match generated {
+        let (_, response, response_bytes) = match generated {
             Ok(response) => response,
             Err(_) => {
                 results[0] = Val::Variant(
@@ -1208,7 +1305,11 @@ fn read_capability_config() -> Result<Option<(Arc<ResidentCapabilityConfig>, Str
     }
     if let Some(http) = config.http.as_ref() {
         loopback_endpoint(&http.endpoint)?;
-        if http.audit_id.is_empty() || http.max_response_bytes == 0 || http.deadline_ms == 0 {
+        if http.audit_id.is_empty()
+            || http.max_request_bytes == Some(0)
+            || http.max_response_bytes == 0
+            || http.deadline_ms == 0
+        {
             bail!("resident HTTP capability contains an unbounded field");
         }
     }
@@ -1720,8 +1821,9 @@ mod tests {
             format: "kototama.resident-capabilities/v1".into(),
             http: Some(HttpCapability {
                 endpoint: "http://127.0.0.1:1/http".into(),
-                request_body: json!({}),
-                request_code: 1,
+                request_body: Some(json!({})),
+                request_code: Some(1),
+                max_request_bytes: Some(1024),
                 max_response_bytes: 1024,
                 deadline_ms: 1000,
                 audit_id: "http".into(),
@@ -1765,6 +1867,27 @@ mod tests {
             deadline_ms: 1000,
             audit_id: "commitment-advisor".into(),
         }
+    }
+
+    fn http_ability(endpoint: &str) -> Ability {
+        Ability {
+            target: endpoint.into(),
+            operation: "http/post".into(),
+            max_bytes: 65536,
+            max_items: 1,
+            deadline_ms: 1000,
+            audit_id: "isic6492-intake".into(),
+        }
+    }
+
+    fn http_request(body: &str, timeout_ms: i64) -> Vec<Val> {
+        vec![Val::Variant(
+            "post".into(),
+            Some(Box::new(Val::Record(vec![
+                ("body".into(), Val::String(body.into())),
+                ("timeout-ms".into(), Val::S64(timeout_ms)),
+            ]))),
+        )]
     }
 
     fn llm_request(model: &str) -> Vec<Val> {
@@ -1924,6 +2047,90 @@ mod tests {
         let imports = resident_imports(&config);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].name, "aiueos-llm-generate");
+    }
+
+    #[test]
+    fn resident_capability_config_can_grant_structured_http_only() {
+        let config: ResidentCapabilityConfig = serde_json::from_value(json!({
+            "format": "kototama.resident-capabilities/v1",
+            "http": {
+                "endpoint": "http://127.0.0.1:18080/api/loan/intake",
+                "max-request-bytes": 65536,
+                "max-response-bytes": 65536,
+                "deadline-ms": 1000,
+                "audit-id": "isic6492-intake"
+            }
+        }))
+        .unwrap();
+        let imports = resident_imports(&config);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].name, "aiueos-http-post");
+    }
+
+    #[test]
+    fn structured_http_posts_only_to_the_configured_loopback_provider() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://127.0.0.1:{}/api/loan/intake",
+            listener.local_addr().unwrap().port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !String::from_utf8_lossy(&request).contains("\"requested-principal\":100000") {
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /api/loan/intake HTTP/1.1"));
+            let body = br#"{"ok":true,"id":"loan-1"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let mut session = EffectSession::new(Arc::new(ResidentCapabilityConfig {
+            format: "kototama.resident-capabilities/v1".into(),
+            http: Some(HttpCapability {
+                endpoint: endpoint.clone(),
+                request_body: None,
+                request_code: None,
+                max_request_bytes: Some(65536),
+                max_response_bytes: 65536,
+                deadline_ms: 1000,
+                audit_id: "isic6492-intake".into(),
+            }),
+            storage: None,
+            llm: None,
+        }));
+        let mut result = vec![Val::Bool(false)];
+        session
+            .post_value(
+                &http_ability(&endpoint),
+                &http_request(r#"{"requested-principal":100000}"#, 1000),
+                &mut result,
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert!(matches!(
+            &result[0],
+            Val::Variant(case, Some(payload))
+                if case == "ok"
+                    && matches!(payload.as_ref(), Val::Record(fields)
+                        if matches!(fields.first(), Some((name, Val::S64(201)))
+                            if name == "status")
+                        && matches!(fields.last(), Some((name, Val::String(body)))
+                            if name == "body" && body.contains("\"loan-1\"")))
+        ));
+        assert_eq!(session.events.len(), 1);
     }
 
     #[test]
